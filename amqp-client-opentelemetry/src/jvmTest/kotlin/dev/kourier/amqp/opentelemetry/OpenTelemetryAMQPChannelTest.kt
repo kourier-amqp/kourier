@@ -121,20 +121,20 @@ class OpenTelemetryAMQPChannelTest {
 
         try {
             // Declare queue before publishing to default exchange
-            channel.queueDeclare("my-queue")
+            channel.queueDeclare("my-observed-queue")
 
             // Publish to default exchange (empty string)
             channel.basicPublish(
                 body = "test".encodeToByteArray(),
                 exchange = "",
-                routingKey = "my-queue",
+                routingKey = "my-observed-queue",
                 properties = Properties()
             )
 
             // Verify span name uses routing key
             val spans = otelTesting.spans
-            val publishSpan = spans.find { it.name == "my-queue send" }
-            assertNotNull(publishSpan, "Span name should be 'my-queue send' when exchange is empty")
+            val publishSpan = spans.find { it.name == "my-observed-queue send" }
+            assertNotNull(publishSpan, "Span name should be 'my-observed-queue send' when exchange is empty")
         } finally {
             runCatching { channel.close() }
             runCatching { connection.close() }

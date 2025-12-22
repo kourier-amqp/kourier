@@ -14,6 +14,10 @@ open class RobustAMQPChannel(
 
     private var restoreCompleted = CompletableDeferred(Unit)
 
+    // Stale delivery tag tracking (similar to Java client's RecoveryAwareChannelN)
+    private var maxSeenDeliveryTag: ULong = 0u
+    private var deliveryTagOffsetBeforeRestore: ULong = 0u
+
     private var declaredQos: DeclaredQos? = null
     private val declaredExchanges = mutableMapOf<String, DeclaredExchange>()
     private val declaredQueues = mutableMapOf<String, DeclaredQueue>()
@@ -21,9 +25,26 @@ open class RobustAMQPChannel(
     private val boundQueues = mutableMapOf<Triple<String, String, String>, BoundQueue>()
     private val consumedQueues = mutableMapOf<Pair<String, String>, ConsumedQueue>()
 
+    private fun trackDeliveryTag(deliveryTag: ULong) {
+        if (deliveryTag > maxSeenDeliveryTag) maxSeenDeliveryTag = deliveryTag
+    }
+
+    private fun isStaleDeliveryTag(deliveryTag: ULong): Boolean {
+        // Delivery tags from before the last restoration are stale
+        return deliveryTagOffsetBeforeRestore > 0u && deliveryTag <= deliveryTagOffsetBeforeRestore
+    }
+
+    /**
+     * Robust channels should not be removed from registry on broker close - they restore instead
+     */
+    override fun shouldRemoveOnBrokerClose(): Boolean = false
+
     @InternalAmqpApi
     fun prepareForRestore() {
         if (restoreCompleted.isCompleted) restoreCompleted = CompletableDeferred()
+        // Save the max delivery tag seen before restoration
+        // Any tags <= this value will be considered stale after restoration
+        deliveryTagOffsetBeforeRestore = maxSeenDeliveryTag
         state = ConnectionState.CLOSED
     }
 
@@ -198,7 +219,12 @@ open class RobustAMQPChannel(
         onCanceled: suspend (AMQPResponse.Channel) -> Unit,
     ): AMQPResponse.Channel.Basic.ConsumeOk {
         return super.basicConsume(
-            queue, consumerTag, noAck, exclusive, arguments, onDelivery,
+            queue, consumerTag, noAck, exclusive, arguments,
+            onDelivery = { delivery ->
+                // Track delivery tag to detect stale acks after restoration
+                trackDeliveryTag(delivery.message.deliveryTag)
+                onDelivery(delivery)
+            },
             onCanceled = { response ->
                 if (response is AMQPResponse.Channel.Closed && state == ConnectionState.OPEN) return@basicConsume
                 onCanceled(response)
@@ -221,6 +247,34 @@ open class RobustAMQPChannel(
             val key = consumedQueues.entries.find { it.value.consumerTag == consumerTag }?.key ?: return@also
             consumedQueues.remove(key)
         }
+    }
+
+    override suspend fun basicAck(deliveryTag: ULong, multiple: Boolean) {
+        // Silently ignore acks for stale delivery tags (from before channel restoration)
+        // This prevents PRECONDITION_FAILED errors when acking old messages
+        if (isStaleDeliveryTag(deliveryTag)) {
+            logger.debug("Ignoring ack for stale delivery tag $deliveryTag (offset: $deliveryTagOffsetBeforeRestore)")
+            return
+        }
+        super.basicAck(deliveryTag, multiple)
+    }
+
+    override suspend fun basicNack(deliveryTag: ULong, multiple: Boolean, requeue: Boolean) {
+        // Silently ignore nacks for stale delivery tags
+        if (isStaleDeliveryTag(deliveryTag)) {
+            logger.debug("Ignoring nack for stale delivery tag $deliveryTag (offset: $deliveryTagOffsetBeforeRestore)")
+            return
+        }
+        super.basicNack(deliveryTag, multiple, requeue)
+    }
+
+    override suspend fun basicReject(deliveryTag: ULong, requeue: Boolean) {
+        // Silently ignore rejects for stale delivery tags
+        if (isStaleDeliveryTag(deliveryTag)) {
+            logger.debug("Ignoring reject for stale delivery tag $deliveryTag (offset: $deliveryTagOffsetBeforeRestore)")
+            return
+        }
+        super.basicReject(deliveryTag, requeue)
     }
 
 }

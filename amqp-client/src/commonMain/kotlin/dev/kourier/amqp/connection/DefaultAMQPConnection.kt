@@ -150,7 +150,7 @@ open class DefaultAMQPConnection(
                     "connection_name" to Field.LongString(config.server.connectionName),
                     "product" to Field.LongString("kourier-amqp-client"),
                     "platform" to Field.LongString("Kotlin"),
-                    "version" to Field.LongString("0.4.0"),
+                    "version" to Field.LongString("0.4.1"),
                     "capabilities" to Field.Table(
                         mapOf(
                             "publisher_confirms" to Field.Boolean(true),
@@ -235,6 +235,11 @@ open class DefaultAMQPConnection(
             )
 
             is Frame.Method.Channel.Close -> channel?.let { channel ->
+                val exception = AMQPException.ChannelClosed(
+                    replyCode = payload.replyCode,
+                    replyText = payload.replyText,
+                    isInitiatedByApplication = false
+                )
                 channel.channelResponses.emit(
                     AMQPResponse.Channel.Closed(
                         channelId = frame.channelId,
@@ -242,12 +247,16 @@ open class DefaultAMQPConnection(
                         replyText = payload.replyText,
                     )
                 )
-                channels.remove(channel.id)
+                if (channel.shouldRemoveOnBrokerClose()) channels.remove(channel.id)
                 val closeOk = Frame(
                     channelId = frame.channelId,
                     payload = Frame.Method.Channel.CloseOk
                 )
                 write(closeOk)
+                // Trigger restoration asynchronously (for RobustAMQPChannel, this will restore)
+                messageListeningScope.launch {
+                    channel.cancelAll(exception)
+                }
             }
 
             is Frame.Method.Channel.CloseOk -> channel?.let { channel ->
