@@ -75,6 +75,13 @@ open class DefaultAMQPChannel(
         error("Expected response of type ${T::class}, but got ${firstResponse::class}")
     }
 
+    /**
+     * Determines whether this channel should be removed from the connection's channel registry
+     * when the broker closes it. Robust channels override this to return false since they restore.
+     */
+    @InternalAmqpApi
+    open fun shouldRemoveOnBrokerClose(): Boolean = true
+
     open suspend fun cancelAll(channelClosed: AMQPException.ChannelClosed) {
         if (state == ConnectionState.CLOSED) return // Already closed
         this.state = ConnectionState.CLOSED

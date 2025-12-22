@@ -5,11 +5,8 @@ import dev.kourier.amqp.BuiltinExchangeType
 import dev.kourier.amqp.Field
 import dev.kourier.amqp.channel.AMQPChannel
 import io.ktor.utils.io.core.*
-import kotlinx.coroutines.DelicateCoroutinesApi
-import kotlinx.coroutines.async
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
 import kotlin.test.*
 import kotlin.time.Duration.Companion.seconds
 import kotlin.uuid.Uuid
@@ -221,6 +218,80 @@ class RobustAMQPChannelTest {
             channel.basicCancel(consumerTag)
             assertTrue(receivedMessages.isClosedForReceive)
             channel.close()
+        }
+    }
+
+    @Test
+    @OptIn(DelicateCoroutinesApi::class)
+    fun testConsumerTimeoutWithManualAck() = runBlocking {
+        withConnection { connection ->
+            val channel = connection.openChannel()
+            val closeEvent = async { channel.closedResponses.first() }
+            val reopenEvent = async { channel.openedResponses.first() }
+
+            val queueName = "test-consumer-timeout-queue-${Uuid.random()}"
+            val exchangeName = "test-consumer-timeout-exchange-${Uuid.random()}"
+            val routingKey = "test.timeout"
+
+            // Declare exchange
+            channel.exchangeDeclare(
+                exchangeName,
+                BuiltinExchangeType.DIRECT,
+                durable = false,
+                arguments = emptyMap()
+            )
+
+            // Declare queue with 1 second consumer timeout
+            channel.queueDeclare(
+                queueName,
+                durable = false,
+                exclusive = false,
+                autoDelete = true,
+                arguments = mapOf("x-consumer-timeout" to Field.Long(1000)) // 1 second timeout
+            )
+
+            // Bind queue to exchange
+            channel.queueBind(queueName, exchangeName, routingKey, arguments = emptyMap())
+
+            // Start consumer with manual ack (noAck = false)
+            val receivedMessages = channel.basicConsume(
+                queue = queueName,
+                consumerTag = "timeout-test-consumer",
+                noAck = false, // Manual ack required
+                exclusive = false,
+                arguments = emptyMap()
+            )
+
+            // Publish a message
+            channel.basicPublish("Message before timeout".toByteArray(), exchangeName, routingKey)
+
+            // Receive the message
+            val delivery = withTimeout(5.seconds) { receivedMessages.receive() }
+            assertEquals("Message before timeout", delivery.message.body.decodeToString())
+
+            // Simulate slow processing that exceeds the consumer timeout
+            delay(2000) // 2 seconds > 1 second timeout
+
+            // At this point, the channel should have been closed by the server due to timeout
+            // Wait for the channel to close and reopen
+            closeEvent.await()
+            reopenEvent.await()
+
+            // Try to ack the old message - this should be silently ignored (stale delivery tag)
+            // The robust client now tracks delivery tags and ignores acks for tags from before restoration
+            channel.basicAck(delivery.message.deliveryTag)
+
+            // Verify the channel is functional after recovery by publishing and consuming a new message
+            channel.basicPublish("Message after restore".toByteArray(), exchangeName, routingKey)
+
+            val delivery2 = withTimeout(5.seconds) { receivedMessages.receive() }
+            assertEquals("Message after restore", delivery2.message.body.decodeToString())
+
+            // Ack the new message immediately (within timeout)
+            channel.basicAck(delivery2.message.deliveryTag)
+
+            channel.close()
+            assertTrue(receivedMessages.isClosedForReceive)
         }
     }
 
