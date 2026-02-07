@@ -35,7 +35,7 @@ suspend fun createRobustAMQPConnection(
  */
 suspend fun createRobustAMQPConnection(
     coroutineScope: CoroutineScope,
-    block: AMQPConfigBuilder.() -> Unit,
+    block: AMQPConfigBuilder.() -> Unit = {},
 ): AMQPConnection = createRobustAMQPConnection(coroutineScope, amqpConfig(block))
 
 /**
