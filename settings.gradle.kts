@@ -1,3 +1,6 @@
+rootProject.name = "kourier"
+enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
+
 pluginManagement {
     repositories {
         mavenCentral()
@@ -9,7 +12,6 @@ plugins {
     id("org.gradle.toolchains.foojay-resolver-convention") version "0.5.0"
 }
 
-rootProject.name = "kourier"
 include(":amqp-core")
 include(":amqp-client")
 include(":amqp-client-robust")

@@ -80,7 +80,7 @@ kotlin {
         }
         val commonMain by getting {
             dependencies {
-                api(project(":amqp-core"))
+                api(projects.amqpCore)
                 api(libs.ktor.network)
                 api(libs.ktor.network.tls)
             }

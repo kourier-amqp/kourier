@@ -54,7 +54,7 @@ kotlin {
         }
         val commonMain by getting {
             dependencies {
-                api(project(":amqp-client"))
+                api(projects.amqpClient)
                 api(libs.opentelemetry.api)
                 api(libs.opentelemetry.context)
                 api(libs.opentelemetry.extension.kotlin)
@@ -64,7 +64,7 @@ kotlin {
         val jvmTest by getting {
             dependencies {
                 implementation(kotlin("test"))
-                implementation(project(":amqp-client-robust"))
+                implementation(projects.amqpClientRobust)
                 implementation("io.opentelemetry:opentelemetry-sdk-testing:1.44.1")
                 implementation("org.junit.jupiter:junit-jupiter-api:5.10.0")
                 runtimeOnly("org.junit.jupiter:junit-jupiter-engine:5.10.0")

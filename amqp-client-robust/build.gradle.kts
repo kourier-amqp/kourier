@@ -81,7 +81,7 @@ kotlin {
         }
         val commonMain by getting {
             dependencies {
-                api(project(":amqp-client"))
+                api(projects.amqpClient)
             }
         }
         val commonTest by getting {

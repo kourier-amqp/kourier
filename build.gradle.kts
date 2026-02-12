@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.multiplatform) apply false
     alias(libs.plugins.maven) apply false
+    alias(libs.plugins.kover)
     alias(libs.plugins.dokka)
 }
 
@@ -19,4 +20,11 @@ allprojects {
     repositories {
         mavenCentral()
     }
+}
+
+dependencies {
+    kover(projects.amqpCore)
+    kover(projects.amqpClient)
+    kover(projects.amqpClientRobust)
+    kover(projects.amqpClientOpentelemetry)
 }
