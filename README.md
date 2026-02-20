@@ -46,7 +46,7 @@ To use kourier, add the following to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("dev.kourier:amqp-client:0.4.1")
+    implementation("dev.kourier:amqp-client:0.4.2")
 }
 ```
 
@@ -54,7 +54,7 @@ Or if you want the robust client with automatic recovery:
 
 ```kotlin
 dependencies {
-    implementation("dev.kourier:amqp-client-robust:0.4.1")
+    implementation("dev.kourier:amqp-client-robust:0.4.2")
 }
 ```
 
@@ -62,7 +62,7 @@ For OpenTelemetry tracing support (requires OpenTelemetry API):
 
 ```kotlin
 dependencies {
-    implementation("dev.kourier:amqp-client-opentelemetry:0.4.1")
+    implementation("dev.kourier:amqp-client-opentelemetry:0.4.2")
     implementation("io.opentelemetry:opentelemetry-api:1.44.1")
 }
 ```
