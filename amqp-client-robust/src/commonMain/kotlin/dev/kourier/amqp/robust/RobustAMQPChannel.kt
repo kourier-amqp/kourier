@@ -60,7 +60,13 @@ open class RobustAMQPChannel(
             declaredQueues.values.forEach { queueDeclare(it) }
             boundExchanges.values.forEach { exchangeBind(it) }
             boundQueues.values.forEach { queueBind(it) }
-            consumedQueues.values.forEach { consumedQueue ->
+
+            // Snapshot the list and clear the map before iterating:
+            // basicConsume() will re-populate consumedQueues with the broker-assigned consumer tag,
+            // which would cause a ConcurrentModificationException if we iterated the live map.
+            val queuesToRestore = consumedQueues.values.toList()
+            consumedQueues.clear()
+            queuesToRestore.forEach { consumedQueue ->
                 basicConsume(
                     queue = consumedQueue.queue,
                     consumerTag = consumedQueue.consumerTag,
@@ -88,6 +94,9 @@ open class RobustAMQPChannel(
         if (channelClosed.isInitiatedByApplication) return super.cancelAll(channelClosed)
 
         if (state == ConnectionState.CLOSED) return // Already closed
+        // If the connection itself is not open, connectionFactory() will restore this channel;
+        // attempting a channel-level restore here would race with that.
+        if (connection.state != ConnectionState.OPEN) return
         logger.debug("Channel $id closed, attempting to restore...")
         restore()
     }

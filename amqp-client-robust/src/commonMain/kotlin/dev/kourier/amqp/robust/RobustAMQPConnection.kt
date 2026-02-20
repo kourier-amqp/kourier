@@ -55,13 +55,26 @@ open class RobustAMQPConnection(
 
     protected suspend fun connectionFactory() {
         while (!connectionClosed.isCompleted) {
-            super.connect()
-            channels.list().filterIsInstance<RobustAMQPChannel>().forEach {
-                it.restore()
-            }
-            closedResponses.first()
-            channels.list().filterIsInstance<RobustAMQPChannel>().forEach {
-                it.prepareForRestore() // Set the state to CLOSED, so that it can be reopened later.
+            try {
+                super.connect()
+                channels.list().filterIsInstance<RobustAMQPChannel>().forEach { channel ->
+                    try {
+                        channel.restore()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        logger.error("Failed to restore channel ${channel.id}, it will be retried on next reconnect", e)
+                    }
+                }
+                closedResponses.first()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error("Connection factory failed, will retry", e)
+            } finally {
+                channels.list().filterIsInstance<RobustAMQPChannel>().forEach {
+                    it.prepareForRestore() // Set the state to CLOSED, so that it can be reopened later.
+                }
             }
         }
     }
