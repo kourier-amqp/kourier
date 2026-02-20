@@ -221,6 +221,61 @@ class RobustAMQPChannelTest {
         }
     }
 
+    /**
+     * Regression test: multiple broker-assigned consumers (empty consumerTag) on the same channel
+     * caused a ConcurrentModificationException in restore() when the channel was closed by the broker,
+     * because basicConsume() adds new entries to consumedQueues while the forEach iteration is in progress.
+     */
+    @Test
+    @OptIn(DelicateCoroutinesApi::class)
+    fun testRestoreMultipleBrokerAssignedConsumersAfterChannelBreak() = runBlocking {
+        withConnection { connection ->
+            val channel = connection.openChannel()
+            val closeEvent = async { channel.closedResponses.first() }
+            val reopenEvent = async { channel.openedResponses.first() }
+
+            val queue1 = "test-multi-consumer-ch-${Uuid.random()}"
+            val queue2 = "test-multi-consumer-ch-${Uuid.random()}"
+            val exchange = "test-multi-consumer-ch-ex-${Uuid.random()}"
+            val routingKey1 = "key1"
+            val routingKey2 = "key2"
+
+            channel.exchangeDeclare(exchange, BuiltinExchangeType.DIRECT, durable = false, arguments = emptyMap())
+            channel.queueDeclare(queue1, durable = false, exclusive = false, autoDelete = true, arguments = emptyMap())
+            channel.queueDeclare(queue2, durable = false, exclusive = false, autoDelete = true, arguments = emptyMap())
+            channel.queueBind(queue1, exchange, routingKey1, arguments = emptyMap())
+            channel.queueBind(queue2, exchange, routingKey2, arguments = emptyMap())
+
+            // Two broker-assigned consumers (empty consumerTag -> broker assigns amq.ctag-...)
+            val messages1 = channel.basicConsume(queue = queue1, noAck = true, arguments = emptyMap())
+            val messages2 = channel.basicConsume(queue = queue2, noAck = true, arguments = emptyMap())
+
+            channel.basicPublish("Before crash 1".toByteArray(), exchange, routingKey1)
+            channel.basicPublish("Before crash 2".toByteArray(), exchange, routingKey2)
+            assertEquals("Before crash 1", withTimeout(5.seconds) { messages1.receive() }.message.body.decodeToString())
+            assertEquals("Before crash 2", withTimeout(5.seconds) { messages2.receive() }.message.body.decodeToString())
+
+            // Break the channel
+            channel.closeByBreaking()
+            closeEvent.await()
+            reopenEvent.await()
+
+            // Publish after restore - both consumers must be active
+            channel.basicPublish("After restore 1".toByteArray(), exchange, routingKey1)
+            channel.basicPublish("After restore 2".toByteArray(), exchange, routingKey2)
+            assertEquals(
+                "After restore 1",
+                withTimeout(5.seconds) { messages1.receive() }.message.body.decodeToString()
+            )
+            assertEquals(
+                "After restore 2",
+                withTimeout(5.seconds) { messages2.receive() }.message.body.decodeToString()
+            )
+
+            channel.close()
+        }
+    }
+
     @Test
     @OptIn(DelicateCoroutinesApi::class)
     fun testConsumerTimeoutWithManualAck() = runBlocking {
