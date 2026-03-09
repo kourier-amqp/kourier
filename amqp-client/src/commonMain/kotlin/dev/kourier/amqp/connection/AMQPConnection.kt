@@ -41,6 +41,18 @@ interface AMQPConnection {
     val closedResponses: Flow<AMQPResponse.Connection.Closed>
 
     /**
+     * A flow of blocked responses from the connection.
+     * Emitted when the broker signals the connection is resource-constrained.
+     */
+    val blockedResponses: Flow<AMQPResponse.Connection.Blocked>
+
+    /**
+     * A flow of unblocked responses from the connection.
+     * Emitted when the broker signals the connection is no longer resource-constrained.
+     */
+    val unblockedResponses: Flow<AMQPResponse.Connection.Unblocked>
+
+    /**
      * Internal API to write raw bytes to the connection.
      */
     @InternalAmqpApi

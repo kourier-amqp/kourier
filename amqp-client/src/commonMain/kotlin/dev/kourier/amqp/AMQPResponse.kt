@@ -109,6 +109,8 @@ sealed class AMQPResponse {
 
         data class Connected(val channelMax: UShort, val frameMax: UInt) : Connection()
         data object Closed : Connection()
+        data class Blocked(val reason: String) : Connection()
+        data object Unblocked : Connection()
 
     }
 
