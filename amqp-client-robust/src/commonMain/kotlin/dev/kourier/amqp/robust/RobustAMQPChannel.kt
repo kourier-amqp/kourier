@@ -5,6 +5,8 @@ import dev.kourier.amqp.channel.*
 import dev.kourier.amqp.connection.ConnectionState
 import dev.kourier.amqp.states.*
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 open class RobustAMQPChannel(
     override val connection: RobustAMQPConnection,
@@ -14,9 +16,15 @@ open class RobustAMQPChannel(
 
     private var restoreCompleted = CompletableDeferred(Unit)
 
-    // Stale delivery tag tracking (similar to Java client's RecoveryAwareChannelN)
-    private var maxSeenDeliveryTag: ULong = 0u
+    // Adjusted delivery tag tracking (similar to Java client's RecoveryAwareChannelN):
+    // Each restore increments deliveryTagOffset by the highest broker tag seen in that epoch,
+    // making adjusted tags globally monotonically increasing across restores so that stale
+    // acks can be detected even when the broker resets its delivery tag counter to 1.
+    // All three fields are guarded by deliveryTagMutex since delivery callbacks run concurrently.
+    private val deliveryTagMutex = Mutex()
+    private var deliveryTagOffset: ULong = 0u
     private var deliveryTagOffsetBeforeRestore: ULong = 0u
+    private var maxBrokerTagInCurrentEpoch: ULong = 0u
 
     private var declaredQos: DeclaredQos? = null
     private val declaredExchanges = mutableMapOf<String, DeclaredExchange>()
@@ -24,15 +32,6 @@ open class RobustAMQPChannel(
     private val boundExchanges = mutableMapOf<Triple<String, String, String>, BoundExchange>()
     private val boundQueues = mutableMapOf<Triple<String, String, String>, BoundQueue>()
     private val consumedQueues = mutableMapOf<Pair<String, String>, ConsumedQueue>()
-
-    private fun trackDeliveryTag(deliveryTag: ULong) {
-        if (deliveryTag > maxSeenDeliveryTag) maxSeenDeliveryTag = deliveryTag
-    }
-
-    private fun isStaleDeliveryTag(deliveryTag: ULong): Boolean {
-        // Delivery tags from before the last restoration are stale
-        return deliveryTagOffsetBeforeRestore > 0u && deliveryTag <= deliveryTagOffsetBeforeRestore
-    }
 
     /**
      * Robust channels should not be removed from registry on broker close - they restore instead
@@ -42,9 +41,12 @@ open class RobustAMQPChannel(
     @InternalAmqpApi
     fun prepareForRestore() {
         if (restoreCompleted.isCompleted) restoreCompleted = CompletableDeferred()
-        // Save the max delivery tag seen before restoration
-        // Any tags <= this value will be considered stale after restoration
-        deliveryTagOffsetBeforeRestore = maxSeenDeliveryTag
+        // Accumulate offset so adjusted tags never repeat across restores.
+        // No need to lock here: prepareForRestore() is always called before the new channel is
+        // open, so no delivery callbacks can be racing at this point.
+        deliveryTagOffset += maxBrokerTagInCurrentEpoch
+        deliveryTagOffsetBeforeRestore = deliveryTagOffset
+        maxBrokerTagInCurrentEpoch = 0u
         state = ConnectionState.CLOSED
     }
 
@@ -218,6 +220,17 @@ open class RobustAMQPChannel(
         }
     }
 
+    override suspend fun basicGet(queue: String, noAck: Boolean): AMQPResponse.Channel.Message.Get {
+        val result = super.basicGet(queue, noAck)
+        val message = result.message ?: return result
+        val adjustedMessage = deliveryTagMutex.withLock {
+            val brokerTag = message.deliveryTag
+            if (brokerTag > maxBrokerTagInCurrentEpoch) maxBrokerTagInCurrentEpoch = brokerTag
+            message.copy(deliveryTag = brokerTag + deliveryTagOffset)
+        }
+        return result.copy(message = adjustedMessage)
+    }
+
     override suspend fun basicConsume(
         queue: String,
         consumerTag: String,
@@ -230,9 +243,15 @@ open class RobustAMQPChannel(
         return super.basicConsume(
             queue, consumerTag, noAck, exclusive, arguments,
             onDelivery = { delivery ->
-                // Track delivery tag to detect stale acks after restoration
-                trackDeliveryTag(delivery.message.deliveryTag)
-                onDelivery(delivery)
+                val adjustedDelivery = deliveryTagMutex.withLock {
+                    val brokerTag = delivery.message.deliveryTag
+                    if (brokerTag > maxBrokerTagInCurrentEpoch) maxBrokerTagInCurrentEpoch = brokerTag
+                    // Adjust the delivery tag to be globally unique across restores.
+                    // The broker resets its counter to 1 on each new channel, but consumers store the
+                    // tag and use it later for basicAck — so we make it monotonically increasing here.
+                    delivery.copy(message = delivery.message.copy(deliveryTag = brokerTag + deliveryTagOffset))
+                }
+                onDelivery(adjustedDelivery)
             },
             onCanceled = { response ->
                 if (response is AMQPResponse.Channel.Closed && state == ConnectionState.OPEN) return@basicConsume
@@ -261,29 +280,38 @@ open class RobustAMQPChannel(
     override suspend fun basicAck(deliveryTag: ULong, multiple: Boolean) {
         // Silently ignore acks for stale delivery tags (from before channel restoration)
         // This prevents PRECONDITION_FAILED errors when acking old messages
-        if (isStaleDeliveryTag(deliveryTag)) {
+        val (stale, brokerTag) = deliveryTagMutex.withLock {
+            Pair(deliveryTag <= deliveryTagOffsetBeforeRestore, deliveryTag - deliveryTagOffset)
+        }
+        if (stale) {
             logger.debug("Ignoring ack for stale delivery tag $deliveryTag (offset: $deliveryTagOffsetBeforeRestore)")
             return
         }
-        super.basicAck(deliveryTag, multiple)
+        super.basicAck(brokerTag, multiple)
     }
 
     override suspend fun basicNack(deliveryTag: ULong, multiple: Boolean, requeue: Boolean) {
         // Silently ignore nacks for stale delivery tags
-        if (isStaleDeliveryTag(deliveryTag)) {
+        val (stale, brokerTag) = deliveryTagMutex.withLock {
+            Pair(deliveryTag <= deliveryTagOffsetBeforeRestore, deliveryTag - deliveryTagOffset)
+        }
+        if (stale) {
             logger.debug("Ignoring nack for stale delivery tag $deliveryTag (offset: $deliveryTagOffsetBeforeRestore)")
             return
         }
-        super.basicNack(deliveryTag, multiple, requeue)
+        super.basicNack(brokerTag, multiple, requeue)
     }
 
     override suspend fun basicReject(deliveryTag: ULong, requeue: Boolean) {
         // Silently ignore rejects for stale delivery tags
-        if (isStaleDeliveryTag(deliveryTag)) {
+        val (stale, brokerTag) = deliveryTagMutex.withLock {
+            Pair(deliveryTag <= deliveryTagOffsetBeforeRestore, deliveryTag - deliveryTagOffset)
+        }
+        if (stale) {
             logger.debug("Ignoring reject for stale delivery tag $deliveryTag (offset: $deliveryTagOffsetBeforeRestore)")
             return
         }
-        super.basicReject(deliveryTag, requeue)
+        super.basicReject(brokerTag, requeue)
     }
 
 }
