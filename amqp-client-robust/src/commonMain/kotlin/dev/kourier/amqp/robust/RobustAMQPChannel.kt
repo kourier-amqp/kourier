@@ -14,9 +14,13 @@ open class RobustAMQPChannel(
 
     private var restoreCompleted = CompletableDeferred(Unit)
 
-    // Stale delivery tag tracking (similar to Java client's RecoveryAwareChannelN)
-    private var maxSeenDeliveryTag: ULong = 0u
+    // Adjusted delivery tag tracking (similar to Java client's RecoveryAwareChannelN):
+    // Each restore increments deliveryTagOffset by the highest broker tag seen in that epoch,
+    // making adjusted tags globally monotonically increasing across restores so that stale
+    // acks can be detected even when the broker resets its delivery tag counter to 1.
+    private var deliveryTagOffset: ULong = 0u
     private var deliveryTagOffsetBeforeRestore: ULong = 0u
+    private var maxBrokerTagInCurrentEpoch: ULong = 0u
 
     private var declaredQos: DeclaredQos? = null
     private val declaredExchanges = mutableMapOf<String, DeclaredExchange>()
@@ -25,13 +29,11 @@ open class RobustAMQPChannel(
     private val boundQueues = mutableMapOf<Triple<String, String, String>, BoundQueue>()
     private val consumedQueues = mutableMapOf<Pair<String, String>, ConsumedQueue>()
 
-    private fun trackDeliveryTag(deliveryTag: ULong) {
-        if (deliveryTag > maxSeenDeliveryTag) maxSeenDeliveryTag = deliveryTag
-    }
-
-    private fun isStaleDeliveryTag(deliveryTag: ULong): Boolean {
-        // Delivery tags from before the last restoration are stale
-        return deliveryTagOffsetBeforeRestore > 0u && deliveryTag <= deliveryTagOffsetBeforeRestore
+    private fun isStaleDeliveryTag(adjustedDeliveryTag: ULong): Boolean {
+        // Adjusted tags from before the last restoration are stale.
+        // deliveryTagOffsetBeforeRestore is the ceiling of all adjusted tags issued before the
+        // most recent restore, so any tag <= it was issued on an old channel.
+        return adjustedDeliveryTag <= deliveryTagOffsetBeforeRestore
     }
 
     /**
@@ -42,9 +44,10 @@ open class RobustAMQPChannel(
     @InternalAmqpApi
     fun prepareForRestore() {
         if (restoreCompleted.isCompleted) restoreCompleted = CompletableDeferred()
-        // Save the max delivery tag seen before restoration
-        // Any tags <= this value will be considered stale after restoration
-        deliveryTagOffsetBeforeRestore = maxSeenDeliveryTag
+        // Accumulate offset so adjusted tags never repeat across restores
+        deliveryTagOffset += maxBrokerTagInCurrentEpoch
+        deliveryTagOffsetBeforeRestore = deliveryTagOffset
+        maxBrokerTagInCurrentEpoch = 0u
         state = ConnectionState.CLOSED
     }
 
@@ -230,9 +233,15 @@ open class RobustAMQPChannel(
         return super.basicConsume(
             queue, consumerTag, noAck, exclusive, arguments,
             onDelivery = { delivery ->
-                // Track delivery tag to detect stale acks after restoration
-                trackDeliveryTag(delivery.message.deliveryTag)
-                onDelivery(delivery)
+                val brokerTag = delivery.message.deliveryTag
+                if (brokerTag > maxBrokerTagInCurrentEpoch) maxBrokerTagInCurrentEpoch = brokerTag
+                // Adjust the delivery tag to be globally unique across restores.
+                // The broker resets its counter to 1 on each new channel, but consumers store the
+                // tag and use it later for basicAck — so we make it monotonically increasing here.
+                val adjustedDelivery = delivery.copy(
+                    message = delivery.message.copy(deliveryTag = brokerTag + deliveryTagOffset)
+                )
+                onDelivery(adjustedDelivery)
             },
             onCanceled = { response ->
                 if (response is AMQPResponse.Channel.Closed && state == ConnectionState.OPEN) return@basicConsume
@@ -265,7 +274,7 @@ open class RobustAMQPChannel(
             logger.debug("Ignoring ack for stale delivery tag $deliveryTag (offset: $deliveryTagOffsetBeforeRestore)")
             return
         }
-        super.basicAck(deliveryTag, multiple)
+        super.basicAck(deliveryTag - deliveryTagOffset, multiple)
     }
 
     override suspend fun basicNack(deliveryTag: ULong, multiple: Boolean, requeue: Boolean) {
@@ -274,7 +283,7 @@ open class RobustAMQPChannel(
             logger.debug("Ignoring nack for stale delivery tag $deliveryTag (offset: $deliveryTagOffsetBeforeRestore)")
             return
         }
-        super.basicNack(deliveryTag, multiple, requeue)
+        super.basicNack(deliveryTag - deliveryTagOffset, multiple, requeue)
     }
 
     override suspend fun basicReject(deliveryTag: ULong, requeue: Boolean) {
@@ -283,7 +292,7 @@ open class RobustAMQPChannel(
             logger.debug("Ignoring reject for stale delivery tag $deliveryTag (offset: $deliveryTagOffsetBeforeRestore)")
             return
         }
-        super.basicReject(deliveryTag, requeue)
+        super.basicReject(deliveryTag - deliveryTagOffset, requeue)
     }
 
 }

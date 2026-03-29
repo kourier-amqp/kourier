@@ -8,6 +8,7 @@ import io.ktor.utils.io.core.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import kotlin.test.*
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.uuid.Uuid
 
@@ -332,8 +333,9 @@ class RobustAMQPChannelTest {
             closeEvent.await()
             reopenEvent.await()
 
-            // Try to ack the old message - this should be silently ignored (stale delivery tag)
-            // The robust client now tracks delivery tags and ignores acks for tags from before restoration
+            // Try to ack the old message - this should be silently ignored (stale delivery tag).
+            // The robust client adjusts delivery tags to be globally increasing across restores, so
+            // any tag <= deliveryTagOffsetBeforeRestore is from an old channel and safely discarded.
             channel.basicAck(delivery.message.deliveryTag)
 
             // Verify the channel is functional after recovery by publishing and consuming a new message
@@ -347,6 +349,85 @@ class RobustAMQPChannelTest {
 
             channel.close()
             assertTrue(receivedMessages.isClosedForReceive)
+        }
+    }
+
+    /**
+     * Regression test for: after channel restoration the broker resets its delivery tag counter to 1,
+     * so a new delivery can have the same numeric tag as a pre-restore delivery.  The robust client
+     * must still be able to ack the new delivery (and must silently drop the old one).
+     *
+     * Previous bug: isStaleDeliveryTag used a plain `tag <= offsetBeforeRestore` numeric comparison,
+     * which falsely treated post-restore tag 1 as stale when offsetBeforeRestore was also 1.
+     *
+     * Fix: delivery tags are adjusted to be globally monotonically increasing across restores
+     * (adjusted = brokerTag + deliveryTagOffset), so tags never repeat from the consumer's perspective.
+     */
+    @Test
+    @OptIn(DelicateCoroutinesApi::class)
+    fun testAckAfterRestoreWithRepeatingDeliveryTag() = runBlocking {
+        withConnection { connection ->
+            val channel = connection.openChannel()
+            val reopenEvent = async { channel.openedResponses.first() }
+
+            val queueName = "test-repeating-tag-queue-${Uuid.random()}"
+            val exchangeName = "test-repeating-tag-exchange-${Uuid.random()}"
+            val routingKey = "test.repeating"
+
+            channel.exchangeDeclare(exchangeName, BuiltinExchangeType.DIRECT, durable = false, arguments = emptyMap())
+            channel.queueDeclare(
+                queueName,
+                durable = false,
+                exclusive = false,
+                autoDelete = true,
+                arguments = mapOf("x-consumer-timeout" to Field.Long(1000)) // 1 second timeout
+            )
+            channel.queueBind(queueName, exchangeName, routingKey, arguments = emptyMap())
+
+            val receivedMessages = channel.basicConsume(
+                queue = queueName,
+                consumerTag = "repeating-tag-consumer",
+                noAck = false,
+                exclusive = false,
+                arguments = emptyMap()
+            )
+
+            // Publish and receive first message (broker assigns delivery tag 1)
+            channel.basicPublish("first".toByteArray(), exchangeName, routingKey)
+            val delivery1 = withTimeout(5.seconds) { receivedMessages.receive() }
+            assertEquals("first", delivery1.message.body.decodeToString())
+
+            // Let the consumer timeout expire without acking — channel gets closed and restored
+            delay(2000)
+            reopenEvent.await()
+
+            // Publish and receive second message (broker resets and assigns delivery tag 1 again on
+            // the new channel, but the robust client adjusts it to be higher than delivery1's tag)
+            channel.basicPublish("second".toByteArray(), exchangeName, routingKey)
+            val delivery2 = withTimeout(5.seconds) { receivedMessages.receive() }
+            assertEquals("second", delivery2.message.body.decodeToString())
+
+            // Adjusted tags must be monotonically increasing: delivery2 must have a higher tag
+            assertTrue(
+                delivery2.message.deliveryTag > delivery1.message.deliveryTag,
+                "Expected delivery2 tag (${delivery2.message.deliveryTag}) > delivery1 tag (${delivery1.message.deliveryTag}) after restore"
+            )
+
+            // Silently discard the stale ack (must not throw or close the channel)
+            channel.basicAck(delivery1.message.deliveryTag)
+
+            // Ack the new delivery — this must reach the broker (not be silently dropped).
+            // If incorrectly treated as stale the broker would redeliver "second" after the timeout.
+            channel.basicAck(delivery2.message.deliveryTag)
+
+            // Verify no redelivery occurs: the channel must stay open and no third message arrives
+            val redelivery = withTimeoutOrNull(2500.milliseconds) { receivedMessages.receive() }
+            assertNull(
+                redelivery,
+                "Expected no redelivery after successful ack, but got: ${redelivery?.message?.body?.decodeToString()}"
+            )
+
+            channel.close()
         }
     }
 
