@@ -62,8 +62,6 @@ open class DefaultAMQPConnection(
     protected var heartbeatSubscription: Job? = null
 
     private val writeMutex = Mutex()
-
-    @Volatile
     private var writeBlockSignal: CompletableDeferred<Unit>? = null
 
     private var channelMax: UShort = 0u
@@ -159,7 +157,7 @@ open class DefaultAMQPConnection(
                     "connection_name" to Field.LongString(config.server.connectionName),
                     "product" to Field.LongString("kourier-amqp-client"),
                     "platform" to Field.LongString("Kotlin"),
-                    "version" to Field.LongString("0.4.2"),
+                    "version" to Field.LongString("0.4.3"),
                     "capabilities" to Field.Table(
                         mapOf(
                             "publisher_confirms" to Field.Boolean(true),
