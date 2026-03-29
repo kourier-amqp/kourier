@@ -63,6 +63,9 @@ open class DefaultAMQPConnection(
 
     private val writeMutex = Mutex()
 
+    @Volatile
+    private var writeBlockSignal: CompletableDeferred<Unit>? = null
+
     private var channelMax: UShort = 0u
     private var frameMax: UInt = 0u
     private var heartbeat: UShort = 60u
@@ -82,6 +85,12 @@ open class DefaultAMQPConnection(
 
     override val closedResponses: Flow<AMQPResponse.Connection.Closed> =
         connectionResponses.filterIsInstance<AMQPResponse.Connection.Closed>()
+
+    override val blockedResponses: Flow<AMQPResponse.Connection.Blocked> =
+        connectionResponses.filterIsInstance<AMQPResponse.Connection.Blocked>()
+
+    override val unblockedResponses: Flow<AMQPResponse.Connection.Unblocked> =
+        connectionResponses.filterIsInstance<AMQPResponse.Connection.Unblocked>()
 
     protected open suspend fun connect() {
         if (socket != null && socket?.isActive == true) return
@@ -224,8 +233,18 @@ open class DefaultAMQPConnection(
 
             is Frame.Method.Connection.CloseOk -> connectionResponses.emit(AMQPResponse.Connection.Closed)
 
-            is Frame.Method.Connection.Blocked -> TODO()
-            is Frame.Method.Connection.Unblocked -> TODO()
+            is Frame.Method.Connection.Blocked -> {
+                logger.debug("Connection blocked by broker: ${payload.reason}")
+                writeBlockSignal = CompletableDeferred()
+                connectionResponses.emit(AMQPResponse.Connection.Blocked(payload.reason))
+            }
+
+            is Frame.Method.Connection.Unblocked -> {
+                logger.debug("Connection unblocked by broker")
+                writeBlockSignal?.complete(Unit)
+                writeBlockSignal = null
+                connectionResponses.emit(AMQPResponse.Connection.Unblocked)
+            }
 
             is Frame.Method.Channel.Open -> error("Unexpected Open frame received: $payload")
             is Frame.Method.Channel.OpenOk -> channel?.channelResponses?.emit(
@@ -448,6 +467,8 @@ open class DefaultAMQPConnection(
 
     @InternalAmqpApi
     override suspend fun write(vararg frames: Frame) {
+        val isHeartbeatOnly = frames.all { it.payload is Frame.Heartbeat }
+        if (!isHeartbeatOnly) writeBlockSignal?.await()
         writeMutex.withLock { // Ensure that all frames are sent in order, without any other writes in between
             if (connectionClosed.isCompleted) throw connectionClosed.await()
             frames.forEach { frame ->
