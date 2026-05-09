@@ -352,6 +352,212 @@ class RobustAMQPChannelTest {
         }
     }
 
+    @Test
+    @OptIn(DelicateCoroutinesApi::class)
+    fun testRestoreTopologyFalseDoesNotTrackResources() = runBlocking {
+        withConnection({ server { restoreTopology = false } }) { connection ->
+            val channel = connection.openChannel() as RobustAMQPChannel
+
+            val queueName = "test-no-track-queue-${Uuid.random()}"
+            val exchange1 = "test-no-track-ex1-${Uuid.random()}"
+            val exchange2 = "test-no-track-ex2-${Uuid.random()}"
+
+            channel.exchangeDeclare(exchange1, BuiltinExchangeType.DIRECT, durable = false, arguments = emptyMap())
+            channel.exchangeDeclare(exchange2, BuiltinExchangeType.FANOUT, durable = false, arguments = emptyMap())
+            channel.queueDeclare(queueName, durable = false, autoDelete = true, arguments = emptyMap())
+            channel.queueBind(queueName, exchange1, "rk", arguments = emptyMap())
+            channel.exchangeBind(exchange1, exchange2, routingKey = "", arguments = emptyMap())
+            channel.basicConsume(
+                queue = queueName,
+                consumerTag = "no-track-consumer",
+                noAck = true,
+                exclusive = false,
+                arguments = emptyMap()
+            )
+
+            assertTrue(channel.declaredExchanges.isEmpty(), "declaredExchanges must stay empty")
+            assertTrue(channel.declaredQueues.isEmpty(), "declaredQueues must stay empty")
+            assertTrue(channel.boundExchanges.isEmpty(), "boundExchanges must stay empty")
+            assertTrue(channel.boundQueues.isEmpty(), "boundQueues must stay empty")
+            // Consumers are still tracked so they get restored even when topology isn't.
+            assertEquals(1, channel.consumedQueues.size, "consumedQueues must still track consumers")
+
+            channel.close()
+        }
+    }
+
+    @Test
+    @OptIn(DelicateCoroutinesApi::class)
+    fun testRestoreTopologyTrueTracksResources() = runBlocking {
+        withConnection { connection ->
+            val channel = connection.openChannel() as RobustAMQPChannel
+
+            val queueName = "test-track-queue-${Uuid.random()}"
+            val exchange1 = "test-track-ex1-${Uuid.random()}"
+            val exchange2 = "test-track-ex2-${Uuid.random()}"
+
+            channel.exchangeDeclare(exchange1, BuiltinExchangeType.DIRECT, durable = false, arguments = emptyMap())
+            channel.exchangeDeclare(exchange2, BuiltinExchangeType.FANOUT, durable = false, arguments = emptyMap())
+            channel.queueDeclare(queueName, durable = false, autoDelete = true, arguments = emptyMap())
+            channel.queueBind(queueName, exchange1, "rk", arguments = emptyMap())
+            channel.exchangeBind(exchange1, exchange2, routingKey = "", arguments = emptyMap())
+
+            assertEquals(2, channel.declaredExchanges.size)
+            assertEquals(1, channel.declaredQueues.size)
+            assertEquals(1, channel.boundExchanges.size)
+            assertEquals(1, channel.boundQueues.size)
+
+            channel.close()
+        }
+    }
+
+    /**
+     * Behavioral test: with restoreTopology=false, consumers are still restored after a channel
+     * break, so messaging keeps flowing as long as the queue exists at the broker (typical
+     * "thousands of worker queues already provisioned" use case). Topology declared on this
+     * channel is not tracked, but the broker-side resources persist on their own (durable,
+     * not auto-delete), so the consumer can re-attach after restore.
+     */
+    @Test
+    @OptIn(DelicateCoroutinesApi::class)
+    fun testRestoreTopologyFalseConsumerStillRestored() = runBlocking {
+        withConnection({ server { restoreTopology = false } }) { connection ->
+            val channel = connection.openChannel()
+            val closeEvent = async { channel.closedResponses.first() }
+            val reopenEvent = async { channel.openedResponses.first() }
+
+            val queueName = "test-no-topo-restore-q-${Uuid.random()}"
+            val exchangeName = "test-no-topo-restore-ex-${Uuid.random()}"
+            val routingKey = "rk"
+
+            channel.exchangeDeclare(exchangeName, BuiltinExchangeType.DIRECT, durable = true, arguments = emptyMap())
+            channel.queueDeclare(queueName, durable = true, autoDelete = false, arguments = emptyMap())
+            channel.queueBind(queueName, exchangeName, routingKey, arguments = emptyMap())
+
+            val received = channel.basicConsume(
+                queue = queueName,
+                consumerTag = "no-topo-consumer",
+                noAck = true,
+                exclusive = false,
+                arguments = emptyMap()
+            )
+
+            channel.basicPublish("Before crash".toByteArray(), exchangeName, routingKey)
+            assertEquals("Before crash", withTimeout(5.seconds) { received.receive() }.message.body.decodeToString())
+
+            channel.closeByBreaking()
+            closeEvent.await()
+            reopenEvent.await()
+
+            channel.basicPublish("After restore".toByteArray(), exchangeName, routingKey)
+            assertEquals("After restore", withTimeout(5.seconds) { received.receive() }.message.body.decodeToString())
+
+            // Cleanup the durable resources we left behind.
+            channel.queueDelete(queueName)
+            channel.exchangeDelete(exchangeName)
+            channel.close()
+        }
+    }
+
+    /**
+     * Differentiator test: with restoreTopology=false, deleted resources stay deleted after a
+     * channel break — the robust client must not redeclare them on restore.
+     */
+    @Test
+    @OptIn(DelicateCoroutinesApi::class)
+    fun testRestoreTopologyFalseSkipsRedeclareOnRestore() = runBlocking {
+        val queueName = "test-skip-redeclare-q-${Uuid.random()}"
+        val exchangeName = "test-skip-redeclare-ex-${Uuid.random()}"
+
+        withConnection { external ->
+            withConnection({ server { restoreTopology = false } }) { connection ->
+                val channel = connection.openChannel()
+                val closeEvent = async { channel.closedResponses.first() }
+                val reopenEvent = async { channel.openedResponses.first() }
+
+                channel.exchangeDeclare(
+                    exchangeName,
+                    BuiltinExchangeType.DIRECT,
+                    durable = false,
+                    arguments = emptyMap()
+                )
+                channel.queueDeclare(queueName, durable = false, autoDelete = false, arguments = emptyMap())
+                channel.queueBind(queueName, exchangeName, "rk", arguments = emptyMap())
+
+                // Delete server-side via a different connection so the robust client doesn't
+                // even see it happen — this mimics another service tearing down resources.
+                val externalChannel = external.openChannel()
+                externalChannel.queueDelete(queueName)
+                externalChannel.exchangeDelete(exchangeName)
+                externalChannel.close()
+
+                channel.closeByBreaking()
+                closeEvent.await()
+                reopenEvent.await()
+
+                // Queue and exchange must NOT exist — robust client did not redeclare them.
+                val checkChannel1 = external.openChannel()
+                assertFailsWith<AMQPException.ChannelClosed> {
+                    checkChannel1.queueDeclarePassive(queueName)
+                }
+
+                val checkChannel2 = external.openChannel()
+                assertFailsWith<AMQPException.ChannelClosed> {
+                    checkChannel2.exchangeDeclarePassive(exchangeName)
+                }
+
+                channel.close()
+            }
+        }
+    }
+
+    /**
+     * Control test for the differentiator above: with default restoreTopology=true, the robust
+     * client redeclares deleted resources on restore (proving the maps were populated and used).
+     */
+    @Test
+    @OptIn(DelicateCoroutinesApi::class)
+    fun testRestoreTopologyTrueRedeclaresAfterExternalDelete() = runBlocking {
+        val queueName = "test-redeclare-q-${Uuid.random()}"
+        val exchangeName = "test-redeclare-ex-${Uuid.random()}"
+
+        withConnection { external ->
+            withConnection { connection ->
+                val channel = connection.openChannel()
+                val closeEvent = async { channel.closedResponses.first() }
+                val reopenEvent = async { channel.openedResponses.first() }
+
+                channel.exchangeDeclare(
+                    exchangeName,
+                    BuiltinExchangeType.DIRECT,
+                    durable = false,
+                    arguments = emptyMap()
+                )
+                channel.queueDeclare(queueName, durable = false, autoDelete = false, arguments = emptyMap())
+                channel.queueBind(queueName, exchangeName, "rk", arguments = emptyMap())
+
+                val externalChannel = external.openChannel()
+                externalChannel.queueDelete(queueName)
+                externalChannel.exchangeDelete(exchangeName)
+                externalChannel.close()
+
+                channel.closeByBreaking()
+                closeEvent.await()
+                reopenEvent.await()
+
+                // Queue and exchange must exist — restore redeclared them from the tracking maps.
+                val checkChannel = external.openChannel()
+                checkChannel.queueDeclarePassive(queueName)
+                checkChannel.exchangeDeclarePassive(exchangeName)
+                checkChannel.queueDelete(queueName)
+                checkChannel.exchangeDelete(exchangeName)
+                checkChannel.close()
+
+                channel.close()
+            }
+        }
+    }
+
     /**
      * Regression test for: after channel restoration the broker resets its delivery tag counter to 1,
      * so a new delivery can have the same numeric tag as a pre-restore delivery.  The robust client

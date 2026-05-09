@@ -29,11 +29,14 @@ open class RobustAMQPChannel(
     private var maxBrokerTagInCurrentEpoch: ULong = 0u
 
     private var declaredQos: DeclaredQos? = null
-    private val declaredExchanges = mutableMapOf<String, DeclaredExchange>()
-    private val declaredQueues = mutableMapOf<String, DeclaredQueue>()
-    private val boundExchanges = mutableMapOf<Triple<String, String, String>, BoundExchange>()
-    private val boundQueues = mutableMapOf<Triple<String, String, String>, BoundQueue>()
-    private val consumedQueues = mutableMapOf<Pair<String, String>, ConsumedQueue>()
+    internal val declaredExchanges = mutableMapOf<String, DeclaredExchange>()
+    internal val declaredQueues = mutableMapOf<String, DeclaredQueue>()
+    internal val boundExchanges = mutableMapOf<Triple<String, String, String>, BoundExchange>()
+    internal val boundQueues = mutableMapOf<Triple<String, String, String>, BoundQueue>()
+    internal val consumedQueues = mutableMapOf<Pair<String, String>, ConsumedQueue>()
+
+    private val restoreTopology: Boolean
+        get() = connection.config.server.restoreTopology
 
     /**
      * Robust channels should not be removed from registry on broker close - they restore instead
@@ -62,10 +65,12 @@ open class RobustAMQPChannel(
                 open()
 
                 declaredQos?.let { basicQos(it) }
-                declaredExchanges.values.forEach { exchangeDeclare(it) }
-                declaredQueues.values.forEach { queueDeclare(it) }
-                boundExchanges.values.forEach { exchangeBind(it) }
-                boundQueues.values.forEach { queueBind(it) }
+                if (restoreTopology) {
+                    declaredExchanges.values.forEach { exchangeDeclare(it) }
+                    declaredQueues.values.forEach { queueDeclare(it) }
+                    boundExchanges.values.forEach { exchangeBind(it) }
+                    boundQueues.values.forEach { queueBind(it) }
+                }
 
                 // Snapshot the list and clear the map before iterating:
                 // basicConsume() will re-populate consumedQueues with the broker-assigned consumer tag,
@@ -139,7 +144,7 @@ open class RobustAMQPChannel(
         arguments: Table,
     ): AMQPResponse.Channel.Exchange.Declared {
         return super.exchangeDeclare(name, type, durable, autoDelete, internal, arguments).also {
-            if (!internal) declaredExchanges[name] = DeclaredExchange(
+            if (!internal && restoreTopology) declaredExchanges[name] = DeclaredExchange(
                 name = name,
                 type = type,
                 durable = durable,
@@ -163,7 +168,7 @@ open class RobustAMQPChannel(
         arguments: Table,
     ): AMQPResponse.Channel.Exchange.Bound {
         return super.exchangeBind(destination, source, routingKey, arguments).also {
-            boundExchanges[Triple(destination, source, routingKey)] = BoundExchange(
+            if (restoreTopology) boundExchanges[Triple(destination, source, routingKey)] = BoundExchange(
                 destination = destination,
                 source = source,
                 routingKey = routingKey,
@@ -191,7 +196,7 @@ open class RobustAMQPChannel(
         arguments: Table,
     ): AMQPResponse.Channel.Queue.Declared {
         return super.queueDeclare(name, durable, exclusive, autoDelete, arguments).also {
-            declaredQueues[name] = DeclaredQueue(
+            if (restoreTopology) declaredQueues[name] = DeclaredQueue(
                 name = name,
                 durable = durable,
                 exclusive = exclusive,
@@ -218,7 +223,7 @@ open class RobustAMQPChannel(
         arguments: Table,
     ): AMQPResponse.Channel.Queue.Bound {
         return super.queueBind(queue, exchange, routingKey, arguments).also {
-            boundQueues[Triple(queue, exchange, routingKey)] = BoundQueue(
+            if (restoreTopology) boundQueues[Triple(queue, exchange, routingKey)] = BoundQueue(
                 queue = queue,
                 exchange = exchange,
                 routingKey = routingKey,

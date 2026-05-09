@@ -23,6 +23,7 @@ data class AMQPConfig(
         val timeout: Duration = Defaults.timeout,
         val connectionName: String = Defaults.CONNECTION_NAME,
         val restoreTimeout: Duration = Defaults.restoreTimeout,
+        val restoreTopology: Boolean = Defaults.RESTORE_TOPOLOGY,
     ) {
 
         object Defaults {
@@ -35,6 +36,7 @@ data class AMQPConfig(
             val timeout: Duration = 60.seconds
             val restoreTimeout: Duration = 15.seconds
             const val CONNECTION_NAME: String = "Kourier AMQP Client"
+            const val RESTORE_TOPOLOGY: Boolean = true
         }
 
     }

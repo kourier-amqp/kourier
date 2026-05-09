@@ -12,6 +12,7 @@ class AMQPConfigServerBuilder {
     var timeout: Duration = AMQPConfig.Server.Defaults.timeout
     var connectionName: String = AMQPConfig.Server.Defaults.CONNECTION_NAME
     var restoreTimeout: Duration = AMQPConfig.Server.Defaults.restoreTimeout
+    var restoreTopology: Boolean = AMQPConfig.Server.Defaults.RESTORE_TOPOLOGY
 
     fun build(): AMQPConfig.Server {
         return AMQPConfig.Server(
@@ -23,6 +24,7 @@ class AMQPConfigServerBuilder {
             timeout = timeout,
             connectionName = connectionName,
             restoreTimeout = restoreTimeout,
+            restoreTopology = restoreTopology,
         )
     }
 
