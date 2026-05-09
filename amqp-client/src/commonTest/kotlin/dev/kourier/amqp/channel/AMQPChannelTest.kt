@@ -27,27 +27,27 @@ class AMQPChannelTest {
         val channel = connection.openChannel()
 
         val queueDeclare = channel.queueDeclare {
-            name = "test"
+            name = "test-queue-not-durable"
             durable = false
         }
-        assertEquals("test", queueDeclare.queueName)
+        assertEquals("test-queue-not-durable", queueDeclare.queueName)
 
         channel.queueBind {
-            queue = "test"
+            queue = "test-queue-not-durable"
             exchange = "amq.topic"
             routingKey = "test"
         }
         channel.queueUnbind {
-            queue = "test"
+            queue = "test-queue-not-durable"
             exchange = "amq.topic"
             routingKey = "test"
         }
 
         channel.queuePurge {
-            name = "test"
+            name = "test-queue-not-durable"
         }
         channel.queueDelete {
-            name = "test"
+            name = "test-queue-not-durable"
         }
 
         channel.close()

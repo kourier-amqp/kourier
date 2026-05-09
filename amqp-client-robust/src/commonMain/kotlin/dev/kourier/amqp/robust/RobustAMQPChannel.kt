@@ -5,8 +5,10 @@ import dev.kourier.amqp.channel.*
 import dev.kourier.amqp.connection.ConnectionState
 import dev.kourier.amqp.states.*
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 
 open class RobustAMQPChannel(
     override val connection: RobustAMQPConnection,
@@ -55,31 +57,47 @@ open class RobustAMQPChannel(
         prepareForRestore()
 
         try {
-            open()
+            // Bound restore so a non-replying broker can't hang every writer on the channel forever.
+            withTimeout(connection.config.server.restoreTimeout) {
+                open()
 
-            declaredQos?.let { basicQos(it) }
-            declaredExchanges.values.forEach { exchangeDeclare(it) }
-            declaredQueues.values.forEach { queueDeclare(it) }
-            boundExchanges.values.forEach { exchangeBind(it) }
-            boundQueues.values.forEach { queueBind(it) }
+                declaredQos?.let { basicQos(it) }
+                declaredExchanges.values.forEach { exchangeDeclare(it) }
+                declaredQueues.values.forEach { queueDeclare(it) }
+                boundExchanges.values.forEach { exchangeBind(it) }
+                boundQueues.values.forEach { queueBind(it) }
 
-            // Snapshot the list and clear the map before iterating:
-            // basicConsume() will re-populate consumedQueues with the broker-assigned consumer tag,
-            // which would cause a ConcurrentModificationException if we iterated the live map.
-            val queuesToRestore = consumedQueues.values.toList()
-            consumedQueues.clear()
-            queuesToRestore.forEach { consumedQueue ->
-                basicConsume(
-                    queue = consumedQueue.queue,
-                    consumerTag = consumedQueue.consumerTag,
-                    noAck = consumedQueue.noAck,
-                    exclusive = consumedQueue.exclusive,
-                    arguments = consumedQueue.arguments,
-                    onDelivery = consumedQueue.onDelivery,
-                    onCanceled = consumedQueue.onCanceled
-                )
+                // Snapshot the list and clear the map before iterating:
+                // basicConsume() will re-populate consumedQueues with the broker-assigned consumer tag,
+                // which would cause a ConcurrentModificationException if we iterated the live map.
+                val queuesToRestore = consumedQueues.values.toList()
+                consumedQueues.clear()
+                queuesToRestore.forEach { consumedQueue ->
+                    basicConsume(
+                        queue = consumedQueue.queue,
+                        consumerTag = consumedQueue.consumerTag,
+                        noAck = consumedQueue.noAck,
+                        exclusive = consumedQueue.exclusive,
+                        arguments = consumedQueue.arguments,
+                        onDelivery = consumedQueue.onDelivery,
+                        onCanceled = consumedQueue.onCanceled
+                    )
+                }
             }
             restoreCompleted.complete(Unit)
+        } catch (e: TimeoutCancellationException) {
+            // Restore stalled (likely broker overload / blackhole). Unblock awaiting writers,
+            // tear down the socket and let connectionFactory() retry on a fresh connection.
+            val timeoutException = RestoreTimeoutException(
+                channelId = id,
+                timeout = connection.config.server.restoreTimeout,
+                cause = e,
+            )
+            restoreCompleted.completeExceptionally(timeoutException)
+            connection.forceReconnect()
+            // Throw a regular Exception (not CancellationException) so connectionFactory()
+            // logs and iterates rather than cancelling the recovery coroutine.
+            throw timeoutException
         } catch (e: Exception) {
             restoreCompleted.completeExceptionally(e)
             throw e

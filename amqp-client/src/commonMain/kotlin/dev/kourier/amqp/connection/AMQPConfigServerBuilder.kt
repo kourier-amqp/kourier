@@ -11,6 +11,7 @@ class AMQPConfigServerBuilder {
     var vhost: String = AMQPConfig.Server.Defaults.VHOST
     var timeout: Duration = AMQPConfig.Server.Defaults.timeout
     var connectionName: String = AMQPConfig.Server.Defaults.CONNECTION_NAME
+    var restoreTimeout: Duration = AMQPConfig.Server.Defaults.restoreTimeout
 
     fun build(): AMQPConfig.Server {
         return AMQPConfig.Server(
@@ -20,7 +21,8 @@ class AMQPConfigServerBuilder {
             password = password,
             vhost = vhost,
             timeout = timeout,
-            connectionName = connectionName
+            connectionName = connectionName,
+            restoreTimeout = restoreTimeout,
         )
     }
 

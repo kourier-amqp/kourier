@@ -4,13 +4,13 @@ import dev.kourier.amqp.AMQPResponse
 import dev.kourier.amqp.ChannelId
 import dev.kourier.amqp.Frame
 import dev.kourier.amqp.channel.AMQPChannel
+import dev.kourier.amqp.channel.DefaultAMQPChannel
 import dev.kourier.amqp.connection.AMQPConfig
 import dev.kourier.amqp.connection.AMQPConnection
 import dev.kourier.amqp.connection.ConnectionState
 import dev.kourier.amqp.connection.DefaultAMQPConnection
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.filterIsInstance
-import kotlinx.coroutines.flow.first
+import kotlin.concurrent.Volatile
 
 open class RobustAMQPConnection(
     config: AMQPConfig,
@@ -41,32 +41,56 @@ open class RobustAMQPConnection(
 
     private var reconnectSubscription: Job? = null
 
+    /**
+     * Per-iteration close signal. Recreated at the top of each [connectionFactory] iteration
+     * and completed by either [closeFromBroker] (the read loop) or [forceReconnect].
+     *
+     * Sidesteps the SharedFlow race where [closedResponses.first] could miss a Closed emission
+     * fired before its subscriber attached. [CompletableDeferred.complete] is idempotent, so
+     * concurrent completions from multiple channels and the read loop are safe.
+     */
+    @Volatile
+    private var iterationClosed: CompletableDeferred<Unit> = CompletableDeferred()
+
     override suspend fun connect() {
         reconnectSubscription?.cancel()
         reconnectSubscription = messageListeningScope.launch {
             connectionFactory()
         }
 
+        // Wait directly on the connectionOpened Deferred (completed inside super.connect())
+        // instead of subscribing to connectionResponses, which would race with the launched
+        // factory's emit and could miss the Connected event entirely on fast loopback.
         withTimeout(config.server.timeout.inWholeMilliseconds) {
-            connectionResponses.filterIsInstance<AMQPResponse.Connection.Connected>().first()
+            connectionOpened.await()
         }
-        connectionOpened.await()
     }
 
     protected suspend fun connectionFactory() {
         while (!connectionClosed.isCompleted) {
+            iterationClosed = CompletableDeferred()
             try {
                 super.connect()
-                channels.list().filterIsInstance<RobustAMQPChannel>().forEach { channel ->
-                    try {
-                        channel.restore()
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        logger.error("Failed to restore channel ${channel.id}, it will be retried on next reconnect", e)
+                // Restore channels concurrently — sequential restore would make the worst-case
+                // wall-clock per iteration N * restoreTimeout when each channel has to time out.
+                // super.connect() must complete before any channel restore (single shared socket).
+                coroutineScope {
+                    channels.list().filterIsInstance<RobustAMQPChannel>().forEach { channel ->
+                        launch {
+                            try {
+                                channel.restore()
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                logger.error(
+                                    "Failed to restore channel ${channel.id}, it will be retried on next reconnect",
+                                    e,
+                                )
+                            }
+                        }
                     }
                 }
-                closedResponses.first()
+                iterationClosed.await()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -85,6 +109,7 @@ open class RobustAMQPConnection(
     override suspend fun close(reason: String, code: UShort): AMQPResponse.Connection.Closed {
         reconnectSubscription?.cancel()
         reconnectSubscription = null
+        iterationClosed.complete(Unit)
 
         return super.close(reason, code)
     }
@@ -95,7 +120,42 @@ open class RobustAMQPConnection(
         // But cancel the socket, otherwise connect won't work.
         socket?.close()
         socket = null
+
+        // The heartbeat job ticks against the now-dead socket until super.connect() restarts.
+        // Cancel it so it doesn't leak; startListening() relaunches it on reconnect.
+        // Do NOT cancel socketSubscription: the read loop is already exiting via the catch
+        // that brought us here.
+        heartbeatSubscription?.cancel()
+        heartbeatSubscription = null
+
+        // Wake up any per-channel writers blocked on writeAndWaitForResponse{...}.first().
+        // Without this, mid-flight calls (channel.open(), exchangeDeclare(), basicQos(), ...)
+        // stay suspended forever because the broker frames they expected will never arrive.
+        val synthetic = AMQPResponse.Channel.Closed(
+            channelId = 0u,
+            replyCode = payload.replyCode,
+            replyText = payload.replyText,
+        )
+        channels.list().filterIsInstance<DefaultAMQPChannel>().forEach { channel ->
+            channel.channelResponses.emit(synthetic.copy(channelId = channel.id))
+        }
+
+        // Unblock connectionFactory() before publishing the connection-level Closed event so
+        // observers see the loop iterate immediately rather than waiting on flow scheduling.
+        iterationClosed.complete(Unit)
         connectionResponses.emit(AMQPResponse.Connection.Closed)
+    }
+
+    /**
+     * Drop the current socket so connectionFactory() iterates again.
+     * Closing the socket causes the read loop to fail, which routes through
+     * closeFromChannelException -> closeFromBroker. We also complete iterationClosed
+     * directly to avoid relying on SharedFlow delivery timing.
+     */
+    internal fun forceReconnect() {
+        if (connectionClosed.isCompleted) return
+        socket?.close()
+        iterationClosed.complete(Unit)
     }
 
 }

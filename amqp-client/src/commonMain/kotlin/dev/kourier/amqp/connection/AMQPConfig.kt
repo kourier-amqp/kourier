@@ -22,6 +22,7 @@ data class AMQPConfig(
         val vhost: String = Defaults.VHOST,
         val timeout: Duration = Defaults.timeout,
         val connectionName: String = Defaults.CONNECTION_NAME,
+        val restoreTimeout: Duration = Defaults.restoreTimeout,
     ) {
 
         object Defaults {
@@ -32,6 +33,7 @@ data class AMQPConfig(
             const val PASSWORD: String = "guest"
             const val VHOST: String = "/"
             val timeout: Duration = 60.seconds
+            val restoreTimeout: Duration = 15.seconds
             const val CONNECTION_NAME: String = "Kourier AMQP Client"
         }
 
