@@ -115,6 +115,11 @@ open class RobustAMQPConnection(
     }
 
     override suspend fun closeFromBroker(payload: Frame.Method.Connection.Close) {
+        // Capture the iteration's deferred up-front. If forceReconnect() (or another
+        // closeFromBroker) races with us and connectionFactory() has already iterated and
+        // reassigned `iterationClosed`, completing the new instance would spuriously unblock
+        // the next iteration's await(). The `===` guard below skips completion in that case.
+        val expected = iterationClosed
         this.state = ConnectionState.SHUTTING_DOWN
         // Don't cancelAll here, as it would cancel the reconnect subscription and complete the connectionClosed deferred.
         // But cancel the socket, otherwise connect won't work.
@@ -142,7 +147,9 @@ open class RobustAMQPConnection(
 
         // Unblock connectionFactory() before publishing the connection-level Closed event so
         // observers see the loop iterate immediately rather than waiting on flow scheduling.
-        iterationClosed.complete(Unit)
+        // Only complete if no concurrent caller has caused the loop to iterate (which would
+        // have replaced iterationClosed with a fresh instance for the next iteration).
+        if (iterationClosed === expected) expected.complete(Unit)
         connectionResponses.emit(AMQPResponse.Connection.Closed)
     }
 
@@ -151,11 +158,16 @@ open class RobustAMQPConnection(
      * Closing the socket causes the read loop to fail, which routes through
      * closeFromChannelException -> closeFromBroker. We also complete iterationClosed
      * directly to avoid relying on SharedFlow delivery timing.
+     *
+     * The `===` guard prevents completing the *next* iteration's deferred when a concurrent
+     * caller has already advanced the loop (e.g. multiple channel restores time out at once
+     * and each calls forceReconnect; the late ones must not unblock the new iteration).
      */
     internal fun forceReconnect() {
         if (connectionClosed.isCompleted) return
+        val expected = iterationClosed
         socket?.close()
-        iterationClosed.complete(Unit)
+        if (iterationClosed === expected) expected.complete(Unit)
     }
 
 }
