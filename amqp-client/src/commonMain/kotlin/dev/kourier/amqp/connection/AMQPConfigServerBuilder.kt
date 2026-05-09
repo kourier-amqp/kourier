@@ -13,6 +13,9 @@ class AMQPConfigServerBuilder {
     var connectionName: String = AMQPConfig.Server.Defaults.CONNECTION_NAME
     var restoreTimeout: Duration = AMQPConfig.Server.Defaults.restoreTimeout
     var restoreTopology: Boolean = AMQPConfig.Server.Defaults.RESTORE_TOPOLOGY
+    var reconnectInitialDelay: Duration = AMQPConfig.Server.Defaults.reconnectInitialDelay
+    var reconnectMaxDelay: Duration = AMQPConfig.Server.Defaults.reconnectMaxDelay
+    var reconnectBackoffMultiplier: Double = AMQPConfig.Server.Defaults.RECONNECT_BACKOFF_MULTIPLIER
 
     fun build(): AMQPConfig.Server {
         return AMQPConfig.Server(
@@ -25,6 +28,9 @@ class AMQPConfigServerBuilder {
             connectionName = connectionName,
             restoreTimeout = restoreTimeout,
             restoreTopology = restoreTopology,
+            reconnectInitialDelay = reconnectInitialDelay,
+            reconnectMaxDelay = reconnectMaxDelay,
+            reconnectBackoffMultiplier = reconnectBackoffMultiplier,
         )
     }
 

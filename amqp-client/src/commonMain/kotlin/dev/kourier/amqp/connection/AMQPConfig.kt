@@ -24,6 +24,9 @@ data class AMQPConfig(
         val connectionName: String = Defaults.CONNECTION_NAME,
         val restoreTimeout: Duration = Defaults.restoreTimeout,
         val restoreTopology: Boolean = Defaults.RESTORE_TOPOLOGY,
+        val reconnectInitialDelay: Duration = Defaults.reconnectInitialDelay,
+        val reconnectMaxDelay: Duration = Defaults.reconnectMaxDelay,
+        val reconnectBackoffMultiplier: Double = Defaults.RECONNECT_BACKOFF_MULTIPLIER,
     ) {
 
         object Defaults {
@@ -37,6 +40,9 @@ data class AMQPConfig(
             val restoreTimeout: Duration = 15.seconds
             const val CONNECTION_NAME: String = "Kourier AMQP Client"
             const val RESTORE_TOPOLOGY: Boolean = true
+            val reconnectInitialDelay: Duration = 1.seconds
+            val reconnectMaxDelay: Duration = 30.seconds
+            const val RECONNECT_BACKOFF_MULTIPLIER: Double = 2.0
         }
 
     }

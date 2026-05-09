@@ -66,11 +66,32 @@ open class RobustAMQPConnection(
         }
     }
 
+    /**
+     * Test seam: lets a subclass replace the underlying socket-level connect with a stub
+     * that throws or records timestamps without going through ktor TCP.
+     * Production override is `super.connect()` — DefaultAMQPConnection.connect().
+     * Calling `super.connect()` directly from [connectionFactory] would be statically bound
+     * and bypass any test override, which makes the reconnect loop untestable in isolation.
+     */
+    protected open suspend fun openConnection() {
+        super.connect()
+    }
+
     protected suspend fun connectionFactory() {
+        // Exponential backoff between failed reconnect attempts. Without this, a broker
+        // outage with fast-failing connect() (ConnectException) loops in microseconds and
+        // floods logs / burns CPU. Reset to initial after a successful iteration so a
+        // long-lived connection that drops twice doesn't carry over an escalated delay.
+        // Loop-local: when connectionFactory() exits and is later relaunched, the backoff
+        // naturally restarts at the configured initial value.
+        val initialDelay = config.server.reconnectInitialDelay
+        val maxDelay = config.server.reconnectMaxDelay
+        val multiplier = config.server.reconnectBackoffMultiplier
+        var retryDelay = initialDelay
         while (!connectionClosed.isCompleted) {
             iterationClosed = CompletableDeferred()
             try {
-                super.connect()
+                openConnection()
                 // Restore channels concurrently — sequential restore would make the worst-case
                 // wall-clock per iteration N * restoreTimeout when each channel has to time out.
                 // super.connect() must complete before any channel restore (single shared socket).
@@ -91,10 +112,17 @@ open class RobustAMQPConnection(
                     }
                 }
                 iterationClosed.await()
+                // Iteration completed normally (connection was opened and later closed).
+                // Reset the backoff so the next failure path starts fresh.
+                retryDelay = initialDelay
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                logger.error("Connection factory failed, will retry", e)
+                logger.error("Connection factory failed, will retry in $retryDelay", e)
+                // delay() is a cooperative cancellation point — an in-flight close() that
+                // cancels reconnectSubscription will short-circuit the sleep cleanly.
+                delay(retryDelay)
+                retryDelay = (retryDelay * multiplier).coerceAtMost(maxDelay)
             } finally {
                 channels.list().filterIsInstance<RobustAMQPChannel>().forEach {
                     it.prepareForRestore() // Set the state to CLOSED, so that it can be reopened later.
