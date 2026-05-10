@@ -2,20 +2,24 @@ package dev.kourier.amqp.robust
 
 import dev.kourier.amqp.connection.AMQPConfigBuilder
 import dev.kourier.amqp.connection.AMQPConnection
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
 
-fun withConnection(
+suspend fun withConnection(
     block: suspend (AMQPConnection) -> Unit,
 ) = withConnection({}, block)
 
-fun withConnection(
+suspend fun withConnection(
     configure: AMQPConfigBuilder.() -> Unit,
     block: suspend (AMQPConnection) -> Unit,
-) = runBlocking {
-    val connection = createRobustAMQPConnection(this, configure)
-    try {
-        block(connection)
-    } finally {
-        connection.close()
+) = withContext(Dispatchers.Default) {
+    coroutineScope {
+        val connection = createRobustAMQPConnection(this, configure)
+        try {
+            block(connection)
+        } finally {
+            connection.close()
+        }
     }
 }

@@ -277,7 +277,27 @@ open class RobustAMQPChannel(
                 onDelivery(adjustedDelivery)
             },
             onCanceled = { response ->
-                if (response is AMQPResponse.Channel.Closed && state == ConnectionState.OPEN) return@basicConsume
+                // Forward Channel.Closed to the user only on a terminal close (user-initiated
+                // channel.close() or terminal connection close). Transient broker/connection
+                // closes are restored — the consumer must not see a cancellation for those,
+                // otherwise its receive-channel would close and never reattach to the
+                // post-restore listener.
+                //
+                // The previous predicate `state == OPEN` was racy: prepareForRestore() flips
+                // state OPEN→CLOSED on the connectionFactory thread concurrently with the
+                // listener's read, so during reconnect the check could observe CLOSED and
+                // (incorrectly) forward — closing the user's ReceiveChannel mid-restore.
+                //
+                // Race-free signals (all monotonic, set synchronously by the originator):
+                //  - state == SHUTTING_DOWN: set by close() before sending the close frame.
+                //  - channelClosed.isCompleted: completed by cancelAll on user-init close.
+                //  - connection.connectionClosed.isCompleted: connection terminally closed.
+                if (response is AMQPResponse.Channel.Closed) {
+                    val terminal = state == ConnectionState.SHUTTING_DOWN
+                            || channelClosed.isCompleted
+                            || connection.connectionClosed.isCompleted
+                    if (!terminal) return@basicConsume
+                }
                 onCanceled(response)
             }
         ).also {

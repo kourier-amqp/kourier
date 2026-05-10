@@ -429,11 +429,11 @@ class OpenTelemetryAMQPChannelTest {
             assertNotNull(queueBindSpan, "queueBind span should be created when enabled")
 
             // Verify attributes
-            val queueAttrs = queueDeclareSpan!!.attributes.asMap()
+            val queueAttrs = queueDeclareSpan.attributes.asMap()
             assertEquals("test-queue-mgmt", queueAttrs[stringKey("messaging.queue.name")])
             assertEquals(true, queueAttrs[boolKey("messaging.queue.durable")])
 
-            val exchangeAttrs = exchangeDeclareSpan!!.attributes.asMap()
+            val exchangeAttrs = exchangeDeclareSpan.attributes.asMap()
             assertEquals("test-exchange-mgmt", exchangeAttrs[stringKey("messaging.exchange.name")])
             assertEquals("direct", exchangeAttrs[stringKey(SemanticAttributes.MESSAGING_RABBITMQ_EXCHANGE_TYPE)])
         } finally {

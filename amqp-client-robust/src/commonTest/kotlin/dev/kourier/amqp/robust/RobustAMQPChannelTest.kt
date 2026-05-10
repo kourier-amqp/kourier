@@ -7,6 +7,7 @@ import dev.kourier.amqp.channel.AMQPChannel
 import io.ktor.utils.io.core.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.runTest
 import kotlin.test.*
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -28,7 +29,7 @@ class RobustAMQPChannelTest {
 
     @Test
     @OptIn(DelicateCoroutinesApi::class)
-    fun testDeclareAndRestoreEverything() = runBlocking {
+    fun testDeclareAndRestoreEverything() = runTest {
         withConnection { connection ->
             val channel = connection.openChannel()
             val closeEvent = async { channel.closedResponses.first() }
@@ -102,7 +103,7 @@ class RobustAMQPChannelTest {
     }
 
     @Test
-    fun testGetQueueFail() = runBlocking {
+    fun testGetQueueFail() = runTest {
         withConnection { connection ->
             val channel = connection.openChannel()
             val closeEvent = async { channel.closedResponses.first() }
@@ -124,7 +125,7 @@ class RobustAMQPChannelTest {
     }
 
     @Test
-    fun testDeleteExchange() = runBlocking {
+    fun testDeleteExchange() = runTest {
         withConnection { connection ->
             val channel = connection.openChannel()
             val closeEvent = async { channel.closedResponses.first() }
@@ -152,7 +153,7 @@ class RobustAMQPChannelTest {
     }
 
     @Test
-    fun testDeleteQueue() = runBlocking {
+    fun testDeleteQueue() = runTest {
         withConnection { connection ->
             val channel = connection.openChannel()
             val closeEvent = async { channel.closedResponses.first() }
@@ -187,7 +188,7 @@ class RobustAMQPChannelTest {
 
     @Test
     @OptIn(DelicateCoroutinesApi::class)
-    fun testCancelConsume() = runBlocking {
+    fun testCancelConsume() = runTest {
         withConnection { connection ->
             val channel = connection.openChannel()
             val closeEvent = async { channel.closedResponses.first() }
@@ -229,7 +230,7 @@ class RobustAMQPChannelTest {
      */
     @Test
     @OptIn(DelicateCoroutinesApi::class)
-    fun testRestoreMultipleBrokerAssignedConsumersAfterChannelBreak() = runBlocking {
+    fun testRestoreMultipleBrokerAssignedConsumersAfterChannelBreak() = runTest {
         withConnection { connection ->
             val channel = connection.openChannel()
             val closeEvent = async { channel.closedResponses.first() }
@@ -279,7 +280,7 @@ class RobustAMQPChannelTest {
 
     @Test
     @OptIn(DelicateCoroutinesApi::class)
-    fun testConsumerTimeoutWithManualAck() = runBlocking {
+    fun testConsumerTimeoutWithManualAck() = runTest(timeout = 120.seconds) {
         withConnection { connection ->
             val channel = connection.openChannel()
             val closeEvent = async { channel.closedResponses.first() }
@@ -354,7 +355,7 @@ class RobustAMQPChannelTest {
 
     @Test
     @OptIn(DelicateCoroutinesApi::class)
-    fun testRestoreTopologyFalseDoesNotTrackResources() = runBlocking {
+    fun testRestoreTopologyFalseDoesNotTrackResources() = runTest {
         withConnection({ server { restoreTopology = false } }) { connection ->
             val channel = connection.openChannel() as RobustAMQPChannel
 
@@ -388,7 +389,7 @@ class RobustAMQPChannelTest {
 
     @Test
     @OptIn(DelicateCoroutinesApi::class)
-    fun testRestoreTopologyTrueTracksResources() = runBlocking {
+    fun testRestoreTopologyTrueTracksResources() = runTest {
         withConnection { connection ->
             val channel = connection.openChannel() as RobustAMQPChannel
 
@@ -420,7 +421,7 @@ class RobustAMQPChannelTest {
      */
     @Test
     @OptIn(DelicateCoroutinesApi::class)
-    fun testRestoreTopologyFalseConsumerStillRestored() = runBlocking {
+    fun testRestoreTopologyFalseConsumerStillRestored() = runTest {
         withConnection({ server { restoreTopology = false } }) { connection ->
             val channel = connection.openChannel()
             val closeEvent = async { channel.closedResponses.first() }
@@ -465,7 +466,7 @@ class RobustAMQPChannelTest {
      */
     @Test
     @OptIn(DelicateCoroutinesApi::class)
-    fun testRestoreTopologyFalseSkipsRedeclareOnRestore() = runBlocking {
+    fun testRestoreTopologyFalseSkipsRedeclareOnRestore() = runTest {
         val queueName = "test-skip-redeclare-q-${Uuid.random()}"
         val exchangeName = "test-skip-redeclare-ex-${Uuid.random()}"
 
@@ -517,7 +518,7 @@ class RobustAMQPChannelTest {
      */
     @Test
     @OptIn(DelicateCoroutinesApi::class)
-    fun testRestoreTopologyTrueRedeclaresAfterExternalDelete() = runBlocking {
+    fun testRestoreTopologyTrueRedeclaresAfterExternalDelete() = runTest {
         val queueName = "test-redeclare-q-${Uuid.random()}"
         val exchangeName = "test-redeclare-ex-${Uuid.random()}"
 
@@ -571,7 +572,7 @@ class RobustAMQPChannelTest {
      */
     @Test
     @OptIn(DelicateCoroutinesApi::class)
-    fun testAckAfterRestoreWithRepeatingDeliveryTag() = runBlocking {
+    fun testAckAfterRestoreWithRepeatingDeliveryTag() = runTest(timeout = 120.seconds) {
         withConnection { connection ->
             val channel = connection.openChannel()
             val reopenEvent = async { channel.openedResponses.first() }

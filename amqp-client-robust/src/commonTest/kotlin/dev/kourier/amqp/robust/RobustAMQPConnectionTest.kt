@@ -6,11 +6,9 @@ import dev.kourier.amqp.connection.ConnectionState
 import dev.kourier.amqp.connection.amqpConfig
 import io.ktor.http.*
 import io.ktor.utils.io.core.*
-import kotlinx.coroutines.DelicateCoroutinesApi
-import kotlinx.coroutines.async
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.time.Duration.Companion.seconds
@@ -19,16 +17,18 @@ import kotlin.uuid.Uuid
 class RobustAMQPConnectionTest {
 
     @Test
-    fun testConnectionWithUrl(): Unit = runBlocking {
-        val urlString = "amqp://guest:guest@localhost:5672/"
-        createRobustAMQPConnection(this, urlString).close()
-        createRobustAMQPConnection(this, Url(urlString)).close()
-        createRobustAMQPConnection(this, amqpConfig(urlString)).close()
-        createRobustAMQPConnection(this, amqpConfig(Url(urlString))).close()
+    fun testConnectionWithUrl(): Unit = runTest {
+        withContext(Dispatchers.Default) {
+            val urlString = "amqp://guest:guest@localhost:5672/"
+            createRobustAMQPConnection(this, urlString).close()
+            createRobustAMQPConnection(this, Url(urlString)).close()
+            createRobustAMQPConnection(this, amqpConfig(urlString)).close()
+            createRobustAMQPConnection(this, amqpConfig(Url(urlString))).close()
+        }
     }
 
     @Test
-    fun testConnectionDrops() = runBlocking {
+    fun testConnectionDrops() = runTest {
         withConnection { connection ->
             val closeEvent = async { connection.closedResponses.first() }
             val reopenEvent = async { connection.openedResponses.first() }
@@ -51,7 +51,7 @@ class RobustAMQPConnectionTest {
 
     @Test
     @OptIn(DelicateCoroutinesApi::class)
-    fun testRestoreConsumeAfterConnectionDrops() = runBlocking {
+    fun testRestoreConsumeAfterConnectionDrops() = runTest {
         withConnection { connection ->
             val channel = connection.openChannel()
             val closeEvent = async { connection.closedResponses.first() }
@@ -105,7 +105,7 @@ class RobustAMQPConnectionTest {
 
     @Test
     @OptIn(DelicateCoroutinesApi::class)
-    fun testRestoreConsumeNoTaAfterConnectionDrops() = runBlocking {
+    fun testRestoreConsumeNoTaAfterConnectionDrops() = runTest {
         withConnection { connection ->
             val channel = connection.openChannel()
             val closeEvent = async { connection.closedResponses.first() }
@@ -157,7 +157,7 @@ class RobustAMQPConnectionTest {
     }
 
     @Test
-    fun testConnectionIsOpenAfterCreate() = runBlocking {
+    fun testConnectionIsOpenAfterCreate() = runTest {
         withConnection { connection ->
             assertEquals(ConnectionState.OPEN, connection.state)
         }
@@ -170,7 +170,7 @@ class RobustAMQPConnectionTest {
      */
     @Test
     @OptIn(DelicateCoroutinesApi::class)
-    fun testRestoreMultipleBrokerAssignedConsumersAfterConnectionDrop() = runBlocking {
+    fun testRestoreMultipleBrokerAssignedConsumersAfterConnectionDrop() = runTest {
         withConnection { connection ->
             val channel = connection.openChannel()
             val closeEvent = async { connection.closedResponses.first() }

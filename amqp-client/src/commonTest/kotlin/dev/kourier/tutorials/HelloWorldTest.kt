@@ -5,7 +5,9 @@ import dev.kourier.amqp.connection.amqpConfig
 import dev.kourier.amqp.connection.createAMQPConnection
 import io.ktor.utils.io.core.*
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import kotlin.test.Test
 
 class HelloWorldTest {
@@ -56,9 +58,11 @@ class HelloWorldTest {
     }
 
     @Test
-    fun testHelloWorld() = runBlocking {
-        send(this)
-        receive(this)
+    fun testHelloWorld() = runTest {
+        withContext(Dispatchers.Default) {
+            send(this)
+            receive(this)
+        }
     }
 
 }

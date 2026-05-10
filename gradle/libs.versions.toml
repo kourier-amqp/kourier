@@ -8,6 +8,7 @@ maven = "0.30.0"
 ktor = "3.4.3"
 opentelemetry = "1.56.0"
 opentelemetry-semconv = "1.34.0"
+kotlinx-coroutines = "1.10.2"
 kotlinx-io = "0.7.0"
 kotlinx-serialization = "1.8.1"
 
@@ -23,6 +24,7 @@ maven = { id = "com.vanniktech.maven.publish", version.ref = "maven" }
 [libraries]
 ktor-network = { group = "io.ktor", name = "ktor-network", version.ref = "ktor" }
 ktor-network-tls = { group = "io.ktor", name = "ktor-network-tls", version.ref = "ktor" }
+kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "kotlinx-coroutines" }
 kotlinx-io = { module = "org.jetbrains.kotlinx:kotlinx-io-core", version.ref = "kotlinx-io" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }
 opentelemetry-api = { group = "io.opentelemetry", name = "opentelemetry-api", version.ref = "opentelemetry" }

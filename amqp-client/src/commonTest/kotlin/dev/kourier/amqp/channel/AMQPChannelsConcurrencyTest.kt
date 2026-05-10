@@ -1,7 +1,11 @@
 package dev.kourier.amqp.channel
 
-import kotlinx.coroutines.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -19,7 +23,7 @@ import kotlin.test.assertTrue
 class AMQPChannelsConcurrencyTest {
 
     @Test
-    fun reserveNextDoesNotHandOutDuplicateIdsUnderConcurrency() = runBlocking {
+    fun reserveNextDoesNotHandOutDuplicateIdsUnderConcurrency() = runTest {
         val iterations = 50
         repeat(iterations) {
             val channels = AMQPChannels(channelMax = 200u)
@@ -40,7 +44,7 @@ class AMQPChannelsConcurrencyTest {
     }
 
     @Test
-    fun listIsStableUnderConcurrentMutation() = runBlocking {
+    fun listIsStableUnderConcurrentMutation() = runTest {
         val channels = AMQPChannels(channelMax = 1000u)
         // Pre-populate so list() always has something to walk
         repeat(100) {

@@ -4,6 +4,7 @@ import dev.kourier.amqp.Frame
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
@@ -31,33 +32,35 @@ class WriteBlockedStormTest {
      * completes. With the fix's algorithm (next test), it always completes.
      */
     @Test
-    fun preFixCompletableDeferredAlgorithmCanOrphanWriter(): Unit = runBlocking {
-        var writeBlockSignal: CompletableDeferred<Unit>? = CompletableDeferred()
-        val firstBlockedSet = CompletableDeferred<Unit>()
+    fun preFixCompletableDeferredAlgorithmCanOrphanWriter(): Unit = runTest {
+        withContext(Dispatchers.Default) {
+            var writeBlockSignal: CompletableDeferred<Unit>? = CompletableDeferred()
+            val firstBlockedSet = CompletableDeferred<Unit>()
 
-        // Writer captures the current deferred and awaits it — the bug is exactly this pattern.
-        val writer = async {
-            withTimeoutOrNull(2.seconds) {
-                firstBlockedSet.await()
-                @Suppress("ktlint:standard:annotation")
-                val captured: CompletableDeferred<Unit>? = writeBlockSignal
-                captured?.await()
+            // Writer captures the current deferred and awaits it — the bug is exactly this pattern.
+            val writer = async {
+                withTimeoutOrNull(2.seconds) {
+                    firstBlockedSet.await()
+                    @Suppress("ktlint:standard:annotation")
+                    val captured: CompletableDeferred<Unit>? = writeBlockSignal
+                    captured?.await()
+                }
             }
-        }
-        firstBlockedSet.complete(Unit)
-        // Storm: another "Blocked" arrives and overwrites the original deferred.
-        // The first deferred is orphaned: nothing will ever complete it.
-        delay(50)
-        writeBlockSignal = CompletableDeferred()
-        // "Unblocked" arrives — but only completes the *current* (second) deferred, not the orphan.
-        writeBlockSignal?.complete(Unit)
-        writeBlockSignal = null
+            firstBlockedSet.complete(Unit)
+            // Storm: another "Blocked" arrives and overwrites the original deferred.
+            // The first deferred is orphaned: nothing will ever complete it.
+            delay(50)
+            writeBlockSignal = CompletableDeferred()
+            // "Unblocked" arrives — but only completes the *current* (second) deferred, not the orphan.
+            writeBlockSignal.complete(Unit)
+            writeBlockSignal = null
 
-        val outcome = writer.await()
-        assertTrue(
-            outcome == null,
-            "Pre-fix algorithm must orphan the captured deferred under Blocked->Blocked->Unblocked storm",
-        )
+            val outcome = writer.await()
+            assertTrue(
+                outcome == null,
+                "Pre-fix algorithm must orphan the captured deferred under Blocked->Blocked->Unblocked storm",
+            )
+        }
     }
 
     /**
@@ -66,23 +69,25 @@ class WriteBlockedStormTest {
      * every change and so always completes once the value goes false.
      */
     @Test
-    fun postFixStateFlowAlgorithmAlwaysReleasesWriter(): Unit = runBlocking {
-        val writeBlocked = MutableStateFlow(true)
-        val writer = async {
-            withTimeout(5.seconds) { writeBlocked.first { !it } }
-        }
-        // Storm: toggle several times. The writer keeps re-evaluating because StateFlow
-        // re-emits each distinct value.
-        repeat(50) {
-            yield()
-            writeBlocked.value = true
-            yield()
+    fun postFixStateFlowAlgorithmAlwaysReleasesWriter(): Unit = runTest {
+        withContext(Dispatchers.Default) {
+            val writeBlocked = MutableStateFlow(true)
+            val writer = async {
+                withTimeout(5.seconds) { writeBlocked.first { !it } }
+            }
+            // Storm: toggle several times. The writer keeps re-evaluating because StateFlow
+            // re-emits each distinct value.
+            repeat(50) {
+                yield()
+                writeBlocked.value = true
+                yield()
+                writeBlocked.value = false
+            }
             writeBlocked.value = false
-        }
-        writeBlocked.value = false
 
-        val outcome = withTimeoutOrNull(5.seconds) { writer.await() }
-        assertTrue(outcome != null, "Post-fix StateFlow gate must release writers under storm")
+            val outcome = withTimeoutOrNull(5.seconds) { writer.await() }
+            assertTrue(outcome != null, "Post-fix StateFlow gate must release writers under storm")
+        }
     }
 
     private fun newDisconnectedConnection(scope: CoroutineScope): DefaultAMQPConnection =
@@ -94,37 +99,39 @@ class WriteBlockedStormTest {
      * must progress through it under a Blocked/Unblocked toggle storm.
      */
     @Test
-    fun writersProgressThroughGateUnderStorm(): Unit = runBlocking {
-        val scope = CoroutineScope(coroutineContext + SupervisorJob())
-        val conn = newDisconnectedConnection(scope)
-        try {
-            conn.writeBlocked.value = true
+    fun writersProgressThroughGateUnderStorm(): Unit = runTest {
+        withContext(Dispatchers.Default) {
+            val scope = CoroutineScope(coroutineContext + SupervisorJob())
+            val conn = newDisconnectedConnection(scope)
+            try {
+                conn.writeBlocked.value = true
 
-            val numWriters = 50
-            val writers = (1..numWriters).map {
-                scope.async {
-                    withTimeout(10.seconds) {
-                        conn.write(Frame(channelId = 0u, payload = Frame.Method.Connection.CloseOk))
+                val numWriters = 50
+                val writers = (1..numWriters).map {
+                    scope.async {
+                        withTimeout(10.seconds) {
+                            conn.write(Frame(channelId = 0u, payload = Frame.Method.Connection.CloseOk))
+                        }
                     }
                 }
-            }
 
-            // Toggle storm; pre-fix this would have orphaned a captured deferred.
-            repeat(300) {
-                conn.writeBlocked.value = true
-                yield()
+                // Toggle storm; pre-fix this would have orphaned a captured deferred.
+                repeat(300) {
+                    conn.writeBlocked.value = true
+                    yield()
+                    conn.writeBlocked.value = false
+                    yield()
+                }
                 conn.writeBlocked.value = false
-                yield()
-            }
-            conn.writeBlocked.value = false
 
-            val results = withTimeoutOrNull(15.seconds) { writers.awaitAll() }
-            assertTrue(
-                results != null && results.size == numWriters,
-                "All $numWriters writers must complete after final unblock under Blocked/Unblocked storm",
-            )
-        } finally {
-            scope.cancel()
+                val results = withTimeoutOrNull(15.seconds) { writers.awaitAll() }
+                assertTrue(
+                    results != null && results.size == numWriters,
+                    "All $numWriters writers must complete after final unblock under Blocked/Unblocked storm",
+                )
+            } finally {
+                scope.cancel()
+            }
         }
     }
 }

@@ -5,6 +5,7 @@ import dev.kourier.amqp.connection.createAMQPConnection
 import dev.kourier.amqp.properties
 import io.ktor.utils.io.core.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.uuid.ExperimentalUuidApi
@@ -171,178 +172,184 @@ class RPCTest {
     }
 
     @Test
-    fun testRPC() = runBlocking {
-        // Clear the RPC queue first
-        val config = amqpConfig {
-            server {
-                host = "localhost"
+    fun testRPC() = runTest {
+        withContext(Dispatchers.Default) {
+            // Clear the RPC queue first
+            val config = amqpConfig {
+                server {
+                    host = "localhost"
+                }
             }
+            val setupConnection = createAMQPConnection(this, config)
+            val setupChannel = setupConnection.openChannel()
+            setupChannel.queueDeclare(
+                rpcQueueName,
+                durable = false,
+                exclusive = false,
+                autoDelete = false,
+                arguments = emptyMap()
+            )
+            setupChannel.queuePurge(rpcQueueName)
+            setupChannel.close()
+            setupConnection.close()
+
+            // Start RPC server in background
+            val serverJob = launch {
+                rpcServer(this)
+            }
+
+            // Give server time to start and be ready
+            delay(1000)
+
+            // Make several RPC calls (using smaller numbers to avoid exponential time complexity)
+            val testCases = listOf(
+                Pair(0, 0),
+                Pair(1, 1),
+                Pair(5, 5),
+                Pair(8, 21),
+                Pair(10, 55)
+            )
+
+            for ((input, expectedOutput) in testCases) {
+                val result = rpcClient(this, input)
+                println("[Test] fib($input) = $result (expected $expectedOutput)")
+                assertEquals(expectedOutput, result, "fib($input) should equal $expectedOutput")
+            }
+
+            // Cancel server
+            serverJob.cancel()
         }
-        val setupConnection = createAMQPConnection(this, config)
-        val setupChannel = setupConnection.openChannel()
-        setupChannel.queueDeclare(
-            rpcQueueName,
-            durable = false,
-            exclusive = false,
-            autoDelete = false,
-            arguments = emptyMap()
-        )
-        setupChannel.queuePurge(rpcQueueName)
-        setupChannel.close()
-        setupConnection.close()
-
-        // Start RPC server in background
-        val serverJob = launch {
-            rpcServer(this)
-        }
-
-        // Give server time to start and be ready
-        delay(1000)
-
-        // Make several RPC calls (using smaller numbers to avoid exponential time complexity)
-        val testCases = listOf(
-            Pair(0, 0),
-            Pair(1, 1),
-            Pair(5, 5),
-            Pair(8, 21),
-            Pair(10, 55)
-        )
-
-        for ((input, expectedOutput) in testCases) {
-            val result = rpcClient(this, input)
-            println("[Test] fib($input) = $result (expected $expectedOutput)")
-            assertEquals(expectedOutput, result, "fib($input) should equal $expectedOutput")
-        }
-
-        // Cancel server
-        serverJob.cancel()
     }
 
     @Test
-    fun testMultipleClients() = runBlocking {
-        // Test multiple clients sending requests concurrently
-        val config = amqpConfig {
-            server {
-                host = "localhost"
+    fun testMultipleClients() = runTest {
+        withContext(Dispatchers.Default) {
+            // Test multiple clients sending requests concurrently
+            val config = amqpConfig {
+                server {
+                    host = "localhost"
+                }
             }
-        }
-        val setupConnection = createAMQPConnection(this, config)
-        val setupChannel = setupConnection.openChannel()
-        setupChannel.queueDeclare(
-            rpcQueueName,
-            durable = false,
-            exclusive = false,
-            autoDelete = false,
-            arguments = emptyMap()
-        )
-        setupChannel.queuePurge(rpcQueueName)
-        setupChannel.close()
-        setupConnection.close()
+            val setupConnection = createAMQPConnection(this, config)
+            val setupChannel = setupConnection.openChannel()
+            setupChannel.queueDeclare(
+                rpcQueueName,
+                durable = false,
+                exclusive = false,
+                autoDelete = false,
+                arguments = emptyMap()
+            )
+            setupChannel.queuePurge(rpcQueueName)
+            setupChannel.close()
+            setupConnection.close()
 
-        // Start RPC server
-        val serverJob = launch {
-            rpcServer(this)
-        }
-
-        delay(1000)
-
-        // Launch multiple clients concurrently
-        val results = mutableListOf<Deferred<Pair<Int, Int>>>()
-
-        val requests = listOf(5, 7, 10, 12, 8)
-        for (n in requests) {
-            val deferred = async {
-                val result = rpcClient(this, n)
-                Pair(n, result)
+            // Start RPC server
+            val serverJob = launch {
+                rpcServer(this)
             }
-            results.add(deferred)
+
+            delay(1000)
+
+            // Launch multiple clients concurrently
+            val results = mutableListOf<Deferred<Pair<Int, Int>>>()
+
+            val requests = listOf(5, 7, 10, 12, 8)
+            for (n in requests) {
+                val deferred = async {
+                    val result = rpcClient(this, n)
+                    Pair(n, result)
+                }
+                results.add(deferred)
+            }
+
+            // Wait for all results
+            val allResults = results.awaitAll()
+
+            // Verify results
+            println("\n[Test Summary] Multiple Clients:")
+            for ((input, result) in allResults) {
+                val expected = fib(input)
+                println("fib($input) = $result (expected $expected)")
+                assertEquals(expected, result, "fib($input) should equal $expected")
+            }
+
+            serverJob.cancel()
         }
-
-        // Wait for all results
-        val allResults = results.awaitAll()
-
-        // Verify results
-        println("\n[Test Summary] Multiple Clients:")
-        for ((input, result) in allResults) {
-            val expected = fib(input)
-            println("fib($input) = $result (expected $expected)")
-            assertEquals(expected, result, "fib($input) should equal $expected")
-        }
-
-        serverJob.cancel()
     }
 
     @Test
-    fun testCorrelationId() = runBlocking {
-        // Test that correlation IDs properly match requests to responses
-        val config = amqpConfig {
-            server {
-                host = "localhost"
+    fun testCorrelationId() = runTest {
+        withContext(Dispatchers.Default) {
+            // Test that correlation IDs properly match requests to responses
+            val config = amqpConfig {
+                server {
+                    host = "localhost"
+                }
             }
-        }
-        val setupConnection = createAMQPConnection(this, config)
-        val setupChannel = setupConnection.openChannel()
-        setupChannel.queueDeclare(
-            rpcQueueName,
-            durable = false,
-            exclusive = false,
-            autoDelete = false,
-            arguments = emptyMap()
-        )
-        setupChannel.queuePurge(rpcQueueName)
-        setupChannel.close()
-        setupConnection.close()
+            val setupConnection = createAMQPConnection(this, config)
+            val setupChannel = setupConnection.openChannel()
+            setupChannel.queueDeclare(
+                rpcQueueName,
+                durable = false,
+                exclusive = false,
+                autoDelete = false,
+                arguments = emptyMap()
+            )
+            setupChannel.queuePurge(rpcQueueName)
+            setupChannel.close()
+            setupConnection.close()
 
-        // Start server
-        val serverJob = launch {
-            rpcServer(this)
-        }
-
-        delay(1000)
-
-        // Send request with a specific correlation ID
-        val connection = createAMQPConnection(this, config)
-        val channel = connection.openChannel()
-
-        val callbackQueueDeclared = channel.queueDeclare(
-            name = "",
-            durable = false,
-            exclusive = true,
-            autoDelete = true,
-            arguments = emptyMap()
-        )
-        val callbackQueueName = callbackQueueDeclared.queueName
-
-        // Start consuming BEFORE sending request
-        val consumer = channel.basicConsume(callbackQueueName, noAck = true)
-        var receivedCorrelationId: String? = null
-
-        val correlationId1 = "test-correlation-id-1"
-        val requestProps1 = properties {
-            this.correlationId = correlationId1
-            this.replyTo = callbackQueueName
-        }
-
-        // Send request
-        channel.basicPublish(
-            "6".toByteArray(),
-            exchange = "",
-            routingKey = rpcQueueName,
-            properties = requestProps1
-        )
-
-        withTimeout(10000) { // 10 second timeout
-            for (delivery in consumer) {
-                receivedCorrelationId = delivery.message.properties.correlationId
-                break
+            // Start server
+            val serverJob = launch {
+                rpcServer(this)
             }
+
+            delay(1000)
+
+            // Send request with a specific correlation ID
+            val connection = createAMQPConnection(this, config)
+            val channel = connection.openChannel()
+
+            val callbackQueueDeclared = channel.queueDeclare(
+                name = "",
+                durable = false,
+                exclusive = true,
+                autoDelete = true,
+                arguments = emptyMap()
+            )
+            val callbackQueueName = callbackQueueDeclared.queueName
+
+            // Start consuming BEFORE sending request
+            val consumer = channel.basicConsume(callbackQueueName, noAck = true)
+            var receivedCorrelationId: String? = null
+
+            val correlationId1 = "test-correlation-id-1"
+            val requestProps1 = properties {
+                this.correlationId = correlationId1
+                this.replyTo = callbackQueueName
+            }
+
+            // Send request
+            channel.basicPublish(
+                "6".toByteArray(),
+                exchange = "",
+                routingKey = rpcQueueName,
+                properties = requestProps1
+            )
+
+            withTimeout(10000) { // 10 second timeout
+                for (delivery in consumer) {
+                    receivedCorrelationId = delivery.message.properties.correlationId
+                    break
+                }
+            }
+
+            assertEquals(correlationId1, receivedCorrelationId, "Correlation ID should match")
+
+            channel.close()
+            connection.close()
+            serverJob.cancel()
         }
-
-        assertEquals(correlationId1, receivedCorrelationId, "Correlation ID should match")
-
-        channel.close()
-        connection.close()
-        serverJob.cancel()
     }
 
 }

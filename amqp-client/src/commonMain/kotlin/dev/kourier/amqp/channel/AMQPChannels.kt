@@ -1,8 +1,10 @@
 package dev.kourier.amqp.channel
 
+import dev.kourier.amqp.InternalAmqpApi
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
+@InternalAmqpApi
 class AMQPChannels(
     var channelMax: UShort = 0u,
 ) {
