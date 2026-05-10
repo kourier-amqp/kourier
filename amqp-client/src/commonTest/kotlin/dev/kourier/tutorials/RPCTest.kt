@@ -3,10 +3,12 @@ package dev.kourier.tutorials
 import dev.kourier.amqp.connection.amqpConfig
 import dev.kourier.amqp.connection.createAMQPConnection
 import dev.kourier.amqp.properties
+import io.ktor.utils.io.core.*
 import kotlinx.coroutines.*
-import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.uuid.ExperimentalUuidApi
+import kotlin.uuid.Uuid
 
 class RPCTest {
 
@@ -103,6 +105,7 @@ class RPCTest {
     /**
      * RPC Client - Sends Fibonacci requests and waits for responses.
      */
+    @OptIn(ExperimentalUuidApi::class)
     suspend fun rpcClient(coroutineScope: CoroutineScope, n: Int): Int {
         val config = amqpConfig {
             server {
@@ -124,7 +127,7 @@ class RPCTest {
             val callbackQueueName = callbackQueueDeclared.queueName
 
             // Generate a unique correlation ID for this request
-            val correlationId = UUID.randomUUID().toString()
+            val correlationId = Uuid.random().toString()
 
             // Start consuming BEFORE sending the request to avoid race condition
             val consumer = channel.basicConsume(callbackQueueName, noAck = true)

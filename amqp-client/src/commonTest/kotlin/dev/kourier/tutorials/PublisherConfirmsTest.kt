@@ -4,11 +4,12 @@ import dev.kourier.amqp.AMQPResponse
 import dev.kourier.amqp.Properties
 import dev.kourier.amqp.connection.amqpConfig
 import dev.kourier.amqp.connection.createAMQPConnection
+import io.ktor.utils.io.core.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.take
-import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -66,6 +67,7 @@ class PublisherConfirmsTest {
 
         channel.close()
         connection.close()
+        Unit
     }
 
     @Test
@@ -88,8 +90,31 @@ class PublisherConfirmsTest {
         val batchSize = 10
         val totalMessages = 30
 
+        // Subscribe ONCE up front so we don't drop confirms that arrive between batches.
+        // (publishConfirmResponses is a SharedFlow with replay=0 — emissions before the
+        // collector attaches are silently discarded.)
+        var ackCount = 0
+        var nackCount = 0
+        var resolvedTags = 0uL
+        val confirmJob = launch {
+            channel.publishConfirmResponses.collect { confirm ->
+                when (confirm) {
+                    is AMQPResponse.Channel.Basic.PublishConfirm.Ack -> ackCount++
+                    is AMQPResponse.Channel.Basic.PublishConfirm.Nack -> nackCount++
+                }
+                resolvedTags = maxOf(resolvedTags, confirm.deliveryTag)
+                if (resolvedTags >= totalMessages.toULong()) {
+                    throw CancellationException("All batches confirmed")
+                }
+            }
+        }
+
         var published = 0
         while (published < totalMessages) {
+            val priorAcks = ackCount
+            val priorNacks = nackCount
+            val targetResolved = (published + batchSize).toULong()
+
             // Publish a batch
             for (i in 1..batchSize) {
                 val message = "Batch message ${published + i}"
@@ -101,21 +126,23 @@ class PublisherConfirmsTest {
                 )
             }
 
-            // Wait for all confirms for this batch
-            val confirms = channel.publishConfirmResponses.take(batchSize).toList()
+            // Wait for confirms covering every tag in this batch. The broker may bulk-confirm
+            // (Ack with multiple=true) producing fewer emissions than `batchSize`, so we wait
+            // on the highest deliveryTag rather than counting emissions.
+            while (resolvedTags < targetResolved && confirmJob.isActive) {
+                yield()
+            }
 
-            val ackCount = confirms.count { it is AMQPResponse.Channel.Basic.PublishConfirm.Ack }
-            val nackCount = confirms.count { it is AMQPResponse.Channel.Basic.PublishConfirm.Nack }
-
-            println(" [x] Batch confirmed: $ackCount acks, $nackCount nacks")
-
+            println(" [x] Batch confirmed: ${ackCount - priorAcks} acks, ${nackCount - priorNacks} nacks")
             published += batchSize
         }
 
+        confirmJob.join()
         println("[Batch] All batches confirmed")
 
         channel.close()
         connection.close()
+        Unit
     }
 
     @Test
@@ -137,22 +164,47 @@ class PublisherConfirmsTest {
         println("[Async] Publishing messages with async confirms...")
 
         val messageCount = 20
-        val confirmedMessages = mutableListOf<ULong>()
-        val nackedMessages = mutableListOf<ULong>()
+        val confirmedTags = mutableSetOf<ULong>()
+        val nackedTags = mutableSetOf<ULong>()
+        // Snapshot of the highest tag ever confirmed via multiple=true; needed because the broker
+        // is permitted to send a single Ack(multiple=true) covering several pending publishes.
+        var highestMultipleAck: ULong = 0u
 
-        // Launch coroutine to handle confirms asynchronously
+        // Launch coroutine to handle confirms asynchronously. Stop collecting once every tag
+        // 1..messageCount has been confirmed (either individually or via a multiple=true ack
+        // that covers it) — counting emissions would deadlock when the broker bulk-confirms.
         val confirmJob = launch {
-            channel.publishConfirmResponses.take(messageCount).collect { confirm ->
+            channel.publishConfirmResponses.collect { confirm ->
                 when (confirm) {
                     is AMQPResponse.Channel.Basic.PublishConfirm.Ack -> {
-                        confirmedMessages.add(confirm.deliveryTag)
-                        println(" [✓] Ack for delivery tag: ${confirm.deliveryTag}")
+                        if (confirm.multiple) {
+                            // Acknowledges every still-pending tag up to and including deliveryTag
+                            for (tag in (highestMultipleAck + 1u)..confirm.deliveryTag) {
+                                confirmedTags.add(tag)
+                            }
+                            highestMultipleAck = maxOf(highestMultipleAck, confirm.deliveryTag)
+                            println(" [✓] Ack(multiple) covering up to delivery tag: ${confirm.deliveryTag}")
+                        } else {
+                            confirmedTags.add(confirm.deliveryTag)
+                            println(" [✓] Ack for delivery tag: ${confirm.deliveryTag}")
+                        }
                     }
 
                     is AMQPResponse.Channel.Basic.PublishConfirm.Nack -> {
-                        nackedMessages.add(confirm.deliveryTag)
+                        if (confirm.multiple) {
+                            for (tag in (highestMultipleAck + 1u)..confirm.deliveryTag) {
+                                nackedTags.add(tag)
+                            }
+                            highestMultipleAck = maxOf(highestMultipleAck, confirm.deliveryTag)
+                        } else {
+                            nackedTags.add(confirm.deliveryTag)
+                        }
                         println(" [✗] Nack for delivery tag: ${confirm.deliveryTag}")
                     }
+                }
+                if ((confirmedTags + nackedTags).size >= messageCount) {
+                    // Every publish has been resolved; throw CancellationException to release the collector
+                    throw CancellationException("All confirms received")
                 }
             }
         }
@@ -168,14 +220,15 @@ class PublisherConfirmsTest {
             )
         }
 
-        // Wait for all confirms to be processed
+        // Wait for all confirms to be processed (the collector cancels itself once every tag is resolved)
         confirmJob.join()
 
-        println("[Async] Confirmed: ${confirmedMessages.size}, Nacked: ${nackedMessages.size}")
-        assertEquals(messageCount, confirmedMessages.size, "All messages should be confirmed")
+        println("[Async] Confirmed: ${confirmedTags.size}, Nacked: ${nackedTags.size}")
+        assertEquals(messageCount, confirmedTags.size, "All messages should be confirmed")
 
         channel.close()
         connection.close()
+        Unit
     }
 
     @Test
@@ -196,6 +249,22 @@ class PublisherConfirmsTest {
 
         // Publish several messages
         val messageCount = 10
+        val confirms = mutableListOf<AMQPResponse.Channel.Basic.PublishConfirm>()
+
+        // Subscribe BEFORE publishing so an Ack(multiple=true) covering several pending publishes
+        // — which is one emission, not `messageCount` emissions — does not leave us waiting.
+        val confirmJob = launch {
+            var resolvedTags = 0uL
+            channel.publishConfirmResponses.collect { confirm ->
+                confirms += confirm
+                // Each ack/nack resolves all tags up to deliveryTag; once we've covered every
+                // publish, stop collecting.
+                resolvedTags = maxOf(resolvedTags, confirm.deliveryTag)
+                if (resolvedTags >= messageCount.toULong()) {
+                    throw CancellationException("All confirms received")
+                }
+            }
+        }
 
         for (i in 1..messageCount) {
             channel.basicPublish(
@@ -206,8 +275,7 @@ class PublisherConfirmsTest {
             )
         }
 
-        // Collect confirms (might get bulk confirms with multiple=true)
-        val confirms = channel.publishConfirmResponses.take(messageCount).toList()
+        confirmJob.join()
 
         println("[Multiple] Received ${confirms.size} confirm responses")
 
@@ -221,6 +289,7 @@ class PublisherConfirmsTest {
 
         channel.close()
         connection.close()
+        Unit
     }
 
 }

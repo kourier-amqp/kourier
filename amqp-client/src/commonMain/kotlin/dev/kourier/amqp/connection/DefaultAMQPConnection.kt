@@ -13,14 +13,12 @@ import io.ktor.util.logging.*
 import io.ktor.utils.io.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.filterIsInstance
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.io.IOException
 import kotlinx.serialization.encodeToByteArray
+import kotlin.concurrent.Volatile
 import kotlin.time.Duration.Companion.seconds
 
 open class DefaultAMQPConnection(
@@ -52,6 +50,7 @@ open class DefaultAMQPConnection(
 
     protected val logger = KtorSimpleLogger("AMQPConnection")
 
+    @Volatile
     override var state = ConnectionState.CLOSED
 
     protected var socket: Socket? = null
@@ -62,7 +61,15 @@ open class DefaultAMQPConnection(
     protected var heartbeatSubscription: Job? = null
 
     private val writeMutex = Mutex()
-    private var writeBlockSignal: CompletableDeferred<Unit>? = null
+
+    // Source of truth for the broker-imposed write block. Reads via writeBlocked.first { !it }
+    // before each non-heartbeat write, eliminating the prior CompletableDeferred field-clearing race.
+    @InternalAmqpApi
+    val writeBlocked = MutableStateFlow(false)
+
+    // Serializes close-from-failure transitions so concurrent IO errors / decoder exceptions
+    // don't double-fire the SHUTTING_DOWN -> CLOSED path; the gate inside is "skip if terminal".
+    private val closeMutex = Mutex()
 
     private var channelMax: UShort = 0u
     private var frameMax: UInt = 0u
@@ -233,14 +240,13 @@ open class DefaultAMQPConnection(
 
             is Frame.Method.Connection.Blocked -> {
                 logger.debug("Connection blocked by broker: ${payload.reason}")
-                writeBlockSignal = CompletableDeferred()
+                writeBlocked.value = true
                 connectionResponses.emit(AMQPResponse.Connection.Blocked(payload.reason))
             }
 
             is Frame.Method.Connection.Unblocked -> {
                 logger.debug("Connection unblocked by broker")
-                writeBlockSignal?.complete(Unit)
-                writeBlockSignal = null
+                writeBlocked.value = false
                 connectionResponses.emit(AMQPResponse.Connection.Unblocked)
             }
 
@@ -466,7 +472,11 @@ open class DefaultAMQPConnection(
     @InternalAmqpApi
     override suspend fun write(vararg frames: Frame) {
         val isHeartbeatOnly = frames.all { it.payload is Frame.Heartbeat }
-        if (!isHeartbeatOnly) writeBlockSignal?.await()
+        if (!isHeartbeatOnly && writeBlocked.value) {
+            // Only subscribe (allocates a Flow collector) if we actually need to wait;
+            // unblocking the fast path matters here because every frame goes through it.
+            writeBlocked.first { !it }
+        }
         writeMutex.withLock { // Ensure that all frames are sent in order, without any other writes in between
             if (connectionClosed.isCompleted) throw connectionClosed.await()
             frames.forEach { frame ->
@@ -552,16 +562,24 @@ open class DefaultAMQPConnection(
     }
 
     protected open suspend fun closeFromChannelException(exception: Exception) {
-        if (state != ConnectionState.OPEN) return
-        // Same as if the server closed the connection properly
-        closeFromBroker(
-            Frame.Method.Connection.Close(
-                replyCode = 500u,
-                replyText = exception.message ?: "Channel is closed",
-                failingClassId = 0u,
-                failingMethodId = 0u,
+        // Serialize transition so two concurrent IO failures (read loop + writer) can't both
+        // pass the OPEN gate and double-fire closeFromBroker. The gate stays "only drive
+        // cleanup if currently OPEN" — non-OPEN means another caller (close(), the broker's
+        // explicit Connection.Close, or the robust subclass's broker-close path) is already
+        // handling it; double-firing here would re-enter closeFromBroker against a half-torn
+        // connection, which in robust mode would advance the reconnect loop twice.
+        closeMutex.withLock {
+            if (state != ConnectionState.OPEN) return
+            // Same as if the server closed the connection properly
+            closeFromBroker(
+                Frame.Method.Connection.Close(
+                    replyCode = 500u,
+                    replyText = exception.message ?: "Channel is closed",
+                    failingClassId = 0u,
+                    failingMethodId = 0u,
+                )
             )
-        )
+        }
     }
 
 }

@@ -3,6 +3,7 @@ package dev.kourier.tutorials
 import dev.kourier.amqp.connection.amqpConfig
 import dev.kourier.amqp.connection.createAMQPConnection
 import dev.kourier.amqp.properties
+import io.ktor.utils.io.core.*
 import kotlinx.coroutines.*
 import kotlin.test.Test
 import kotlin.test.assertEquals

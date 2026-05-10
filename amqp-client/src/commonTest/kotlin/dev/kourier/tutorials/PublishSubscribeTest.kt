@@ -4,6 +4,7 @@ import dev.kourier.amqp.BuiltinExchangeType
 import dev.kourier.amqp.Properties
 import dev.kourier.amqp.connection.amqpConfig
 import dev.kourier.amqp.connection.createAMQPConnection
+import io.ktor.utils.io.core.*
 import kotlinx.coroutines.*
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -274,6 +275,7 @@ class PublishSubscribeTest {
 
         channel.close()
         connection.close()
+        Unit
     }
 
     @Test
@@ -310,6 +312,7 @@ class PublishSubscribeTest {
 
         channel.close()
         connection.close()
+        Unit
     }
 
 }

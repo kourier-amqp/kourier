@@ -21,7 +21,7 @@ jobs:
           distribution: 'temurin'
           java-version: 21
       - name: Install dependencies and run tests
-        run: ./gradlew jvmTest koverXmlReport --info
+        run: ./gradlew build koverXmlReport
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
         with:

@@ -1,5 +1,8 @@
 package dev.kourier.amqp.channel
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
 class AMQPChannels(
     var channelMax: UShort = 0u,
 ) {
@@ -10,36 +13,39 @@ class AMQPChannels(
     }
 
     private val channels: MutableMap<UShort, ChannelSlot> = mutableMapOf()
+    private val mutex = Mutex()
 
-    operator fun get(id: UShort): AMQPChannel? {
-        return when (val slot = channels[id]) {
+    suspend operator fun get(id: UShort): AMQPChannel? = mutex.withLock {
+        when (val slot = channels[id]) {
             is ChannelSlot.Channel -> slot.channel
             else -> null
         }
     }
 
-    fun list(): List<AMQPChannel> {
-        return channels.values.filterIsInstance<ChannelSlot.Channel>().map { it.channel }
+    suspend fun list(): List<AMQPChannel> = mutex.withLock {
+        // Snapshot under the lock; the returned list is independent of the backing map.
+        channels.values.filterIsInstance<ChannelSlot.Channel>().map { it.channel }
     }
 
-    fun reserveNext(): UShort? {
-        if (channels.size >= channelMax.toInt()) return null
+    suspend fun reserveNext(): UShort? = mutex.withLock {
+        if (channels.size >= channelMax.toInt()) return@withLock null
         for (i in 1u..channelMax.toUInt()) {
             val index = i.toUShort()
             if (channels[index] == null) {
                 channels[index] = ChannelSlot.Reserved
-                return index
+                return@withLock index
             }
         }
-        return null
+        null
     }
 
-    fun add(channel: AMQPChannel) {
+    suspend fun add(channel: AMQPChannel) = mutex.withLock {
         channels[channel.id] = ChannelSlot.Channel(channel)
     }
 
-    fun remove(id: UShort) {
+    suspend fun remove(id: UShort) = mutex.withLock {
         channels.remove(id)
+        Unit
     }
 
 }

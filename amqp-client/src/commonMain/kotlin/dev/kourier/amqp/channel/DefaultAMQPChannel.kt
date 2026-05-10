@@ -11,6 +11,7 @@ import kotlinx.coroutines.channels.produce
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.concurrent.Volatile
 
 open class DefaultAMQPChannel(
     open val connection: DefaultAMQPConnection,
@@ -26,6 +27,7 @@ open class DefaultAMQPChannel(
     private val deliveryTagMutex = Mutex()
     private var deliveryTag: ULong = 1u
 
+    @Volatile
     override var state = ConnectionState.CLOSED
     private val stateMutex = Mutex()
 
