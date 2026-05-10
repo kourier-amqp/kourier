@@ -120,9 +120,16 @@ open class DefaultAMQPConnection(
 
         startListening()
 
-        write(Protocol.PROTOCOL_START_0_9_1)
+        // Subscribe BEFORE writing the protocol header: `connectionResponses` is a SharedFlow
+        // with replay=0, so a fast Connection.Start/Tune-Ok handshake could emit the
+        // Connected response before our subscription is wired up under multi-thread dispatch.
+        // `onSubscription` must be applied directly to the SharedFlow (it isn't defined for
+        // plain Flow), so attach it first and filter afterwards.
         val response = withTimeout(config.server.timeout.inWholeMilliseconds) {
-            connectionResponses.filterIsInstance<AMQPResponse.Connection.Connected>().first()
+            connectionResponses
+                .onSubscription { write(Protocol.PROTOCOL_START_0_9_1) }
+                .filterIsInstance<AMQPResponse.Connection.Connected>()
+                .first()
         }
 
         this.channelMax = response.channelMax
@@ -488,8 +495,14 @@ open class DefaultAMQPConnection(
 
     @InternalAmqpApi
     suspend inline fun <reified T : AMQPResponse> writeAndWaitForResponse(vararg frames: Frame): T {
-        write(*frames)
-        return connectionResponses.filterIsInstance<T>().first()
+        // Subscribe BEFORE writing: `connectionResponses` is a SharedFlow with replay=0,
+        // so any response emitted before our subscription would be lost. `onSubscription`
+        // must be applied directly to the SharedFlow (it isn't defined for plain Flow);
+        // it fires the write only after the subscription is fully wired up.
+        return connectionResponses
+            .onSubscription { write(*frames) }
+            .filterIsInstance<T>()
+            .first()
     }
 
     protected open fun createChannel(id: ChannelId, frameMax: UInt): AMQPChannel =

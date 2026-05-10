@@ -40,6 +40,13 @@ open class DefaultAMQPChannel(
     @InternalAmqpApi
     val channelResponses = MutableSharedFlow<AMQPResponse>(extraBufferCapacity = Channel.UNLIMITED)
 
+    // Active consumer listening jobs. `cancelAll` joins these so that callers of `close()`
+    // observe the consumer's `onCanceled` side effects (e.g. closing a produce channel)
+    // before close() returns, instead of racing the listener coroutine on Dispatchers.Default.
+    // Guarded by listeningJobsMutex; jobs auto-deregister via invokeOnCompletion.
+    private val listeningJobsMutex = Mutex()
+    private val listeningJobs = mutableSetOf<Job>()
+
     override val channelClosed = CompletableDeferred<AMQPException.ChannelClosed>()
 
     override val openedResponses: Flow<AMQPResponse.Channel.Opened> =
@@ -66,8 +73,15 @@ open class DefaultAMQPChannel(
     @InternalAmqpApi
     suspend inline fun <reified T : AMQPResponse> writeAndWaitForResponse(vararg frames: Frame): T {
         val firstResponse = writeMutex.withLock { // Ensure the response is synchronized with the write operation
-            write(*frames)
-            channelResponses.filter { it is T || it is AMQPResponse.Channel.Closed }.first()
+            // Subscribe BEFORE writing: `channelResponses` is a SharedFlow with replay=0,
+            // so any response emitted before our subscription would be lost. `onSubscription`
+            // must be applied directly to the SharedFlow (it isn't defined for plain Flow),
+            // so attach it first and filter afterwards. The action runs only after the
+            // subscription is fully wired up.
+            channelResponses
+                .onSubscription { write(*frames) }
+                .filter { it is T || it is AMQPResponse.Channel.Closed }
+                .first()
         }
         if (firstResponse is T) return firstResponse
         if (firstResponse is AMQPResponse.Channel.Closed) throw AMQPException.ChannelClosed(
@@ -89,6 +103,12 @@ open class DefaultAMQPChannel(
         this.state = ConnectionState.CLOSED
         logger.debug("Channel $id closed: ${channelClosed.replyText} (${channelClosed.replyCode})")
         this@DefaultAMQPChannel.channelClosed.complete(channelClosed)
+        // Snapshot then join: listener coroutines self-cancel upon receiving Channel.Closed,
+        // but their `onCanceled` callbacks (e.g. closing a produce channel) run AFTER the
+        // SharedFlow emit returned to close()'s writeAndWaitForResponse. Joining here makes
+        // close() synchronous with consumer-side cleanup, so e.g. `channel.basicConsume(...)`
+        // receive-channels are guaranteed closed by the time close() returns.
+        listeningJobsMutex.withLock { listeningJobs.toList() }.joinAll()
     }
 
     override suspend fun open(): AMQPResponse.Channel.Opened = stateMutex.withLock {
@@ -281,6 +301,18 @@ open class DefaultAMQPChannel(
                 }.onFailure { exception ->
                     logger.error("Error in consumer $consumerTag on channel $id", exception)
                 }
+            }
+        }
+        // Track the listening job so that cancelAll can await its completion before close()
+        // returns, ensuring consumer cleanup (e.g. closing a produce channel) is observable
+        // synchronously by close()'s caller. Auto-deregister when the job completes (whether
+        // by self-cancel on Channel.Closed or by external cancellation).
+        listeningJobsMutex.withLock { listeningJobs.add(listeningJob) }
+        listeningJob.invokeOnCompletion {
+            // invokeOnCompletion runs on the completing coroutine context; use launch to avoid
+            // requiring suspend semantics here (mutex.withLock requires suspension).
+            connection.messageListeningScope.launch {
+                listeningJobsMutex.withLock { listeningJobs.remove(listeningJob) }
             }
         }
         deferredListeningJob.complete(listeningJob)
