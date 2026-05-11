@@ -12,6 +12,9 @@ jobs:
       rabbitmq:
         image: rabbitmq:4.1
         ports: [ "5672:5672" ]
+        env:
+          RABBITMQ_LOGS: "-" # log to stdout
+          RABBITMQ_LOG_LEVEL: debug
     steps:
       - name: Checkout
         uses: actions/checkout@v4

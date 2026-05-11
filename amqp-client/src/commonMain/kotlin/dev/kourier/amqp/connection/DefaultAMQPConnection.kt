@@ -271,28 +271,38 @@ open class DefaultAMQPConnection(
                 )
             )
 
-            is Frame.Method.Channel.Close -> channel?.let { channel ->
-                val exception = AMQPException.ChannelClosed(
-                    replyCode = payload.replyCode,
-                    replyText = payload.replyText,
-                    isInitiatedByApplication = false
-                )
-                channel.channelResponses.emit(
-                    AMQPResponse.Channel.Closed(
-                        channelId = frame.channelId,
-                        replyCode = payload.replyCode,
-                        replyText = payload.replyText,
-                    )
-                )
-                if (channel.shouldRemoveOnBrokerClose()) channels.remove(channel.id)
+            is Frame.Method.Channel.Close -> {
+                // ALWAYS send Channel.CloseOk back, even if we don't track this channel id.
+                // Per AMQP 0-9-1 spec section 1.4.2.6, CloseOk confirms a Close and tells the
+                // peer it can release resources. If we silently drop a Close for an unknown
+                // channel id, the broker keeps the id in "awaiting CloseOk" state and rejects
+                // any subsequent Channel.Open on that id with "second 'channel.open' seen"
+                // (CHANNEL_ERROR 504). This affects scenarios where a client-side error
+                // triggers a broker-side channel error on an id we never opened, e.g. sending
+                // an invalid frame referencing an unopened channel.
                 val closeOk = Frame(
                     channelId = frame.channelId,
                     payload = Frame.Method.Channel.CloseOk
                 )
                 write(closeOk)
-                // Trigger restoration asynchronously (for RobustAMQPChannel, this will restore)
-                messageListeningScope.launch {
-                    channel.cancelAll(exception)
+                channel?.let { channel ->
+                    val exception = AMQPException.ChannelClosed(
+                        replyCode = payload.replyCode,
+                        replyText = payload.replyText,
+                        isInitiatedByApplication = false
+                    )
+                    channel.channelResponses.emit(
+                        AMQPResponse.Channel.Closed(
+                            channelId = frame.channelId,
+                            replyCode = payload.replyCode,
+                            replyText = payload.replyText,
+                        )
+                    )
+                    if (channel.shouldRemoveOnBrokerClose()) channels.remove(channel.id)
+                    // Trigger restoration asynchronously (for RobustAMQPChannel, this will restore)
+                    messageListeningScope.launch {
+                        channel.cancelAll(exception)
+                    }
                 }
             }
 
