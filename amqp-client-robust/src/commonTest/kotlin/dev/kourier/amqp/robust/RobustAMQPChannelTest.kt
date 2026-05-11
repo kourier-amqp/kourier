@@ -546,6 +546,14 @@ class RobustAMQPChannelTest {
                 closeEvent.await()
                 reopenEvent.await()
 
+                // reopenEvent fires when restore's open() emits Channel.OpenOk — that's step 1
+                // of restore, before queueDeclare/exchangeDeclare redeclares. Any operation on
+                // this channel (RobustAMQPChannel) goes through write() which awaits
+                // restoreCompleted internally, so a throwaway no-op call synchronizes us with
+                // the rest of restore before we check via the external connection. basicQos
+                // can't trigger a re-restore the way a passive declare on a missing entity could.
+                channel.basicQos(count = 1u)
+
                 // Queue and exchange must exist — restore redeclared them from the tracking maps.
                 val checkChannel = external.openChannel()
                 checkChannel.queueDeclarePassive(queueName)

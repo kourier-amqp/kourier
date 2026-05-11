@@ -109,10 +109,17 @@ open class RobustAMQPChannel(
         }
     }
 
-    override suspend fun write(vararg frames: Frame) {
-        val channelRestoreContext = currentChannelRestoreContext()
-        if (channelRestoreContext == null) restoreCompleted.await() // Wait for restore to complete if not in the restore context
-        super.write(*frames)
+    override suspend fun prepareForWrite() {
+        // Wait for any in-progress restore before letting a user-initiated write proceed.
+        // Invoked by:
+        //   - writeAndWaitForResponse BEFORE writeMutex acquisition (the response-bearing
+        //     RPC path — doing the await inside the mutex would deadlock against restore's
+        //     own writes which need the same mutex).
+        //   - DefaultAMQPChannel.write(), so the no-response paths (basicPublish, basicAck,
+        //     basicNack, the cancel frame from produce's awaitClose) also wait for restore.
+        // Restore's own writes carry [ChannelRestoreContextElement] in the coroutine context
+        // and skip the await to avoid blocking the very restore we'd be waiting on.
+        if (currentChannelRestoreContext() == null) restoreCompleted.await()
     }
 
     override suspend fun cancelAll(channelClosed: AMQPException.ChannelClosed) {

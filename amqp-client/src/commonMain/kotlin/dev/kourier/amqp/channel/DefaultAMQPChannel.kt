@@ -64,22 +64,42 @@ open class DefaultAMQPChannel(
     override val flowResponses: Flow<AMQPResponse.Channel.Flowed> =
         channelResponses.filterIsInstance<AMQPResponse.Channel.Flowed>()
 
+    /**
+     * Hook called by [writeAndWaitForResponse] *before* acquiring [writeMutex]. Subclasses can
+     * override to perform any waiting that must NOT happen while the mutex is held — e.g.
+     * `RobustAMQPChannel` awaits its `restoreCompleted` deferred here, because doing so inside
+     * the mutex would deadlock against restore's own writes (which need the same mutex).
+     */
+    @InternalAmqpApi
+    open suspend fun prepareForWrite() {
+    }
+
     @InternalAmqpApi
     override suspend fun write(vararg frames: Frame) {
         if (channelClosed.isCompleted) throw channelClosed.await()
+        prepareForWrite()
         connection.write(*frames)
     }
 
     @InternalAmqpApi
     suspend inline fun <reified T : AMQPResponse> writeAndWaitForResponse(vararg frames: Frame): T {
+        // Fast-fail on closed channel before any other work — same check that lives in [write],
+        // duplicated here because we bypass the virtual `write` inside the mutex below.
+        if (channelClosed.isCompleted) throw channelClosed.await()
+        prepareForWrite()
         val firstResponse = writeMutex.withLock { // Ensure the response is synchronized with the write operation
             // Subscribe BEFORE writing: `channelResponses` is a SharedFlow with replay=0,
             // so any response emitted before our subscription would be lost. `onSubscription`
             // must be applied directly to the SharedFlow (it isn't defined for plain Flow),
             // so attach it first and filter afterwards. The action runs only after the
             // subscription is fully wired up.
+            //
+            // Call `connection.write` directly (not the virtual `write`) so an overridden
+            // `write` in a subclass (e.g. RobustAMQPChannel awaiting restoreCompleted) can't
+            // re-enter the mutex chain and deadlock against an in-progress restore. The
+            // pre-mutex `prepareForWrite()` hook handles any required wait state.
             channelResponses
-                .onSubscription { write(*frames) }
+                .onSubscription { connection.write(*frames) }
                 .filter { it is T || it is AMQPResponse.Channel.Closed }
                 .first()
         }
