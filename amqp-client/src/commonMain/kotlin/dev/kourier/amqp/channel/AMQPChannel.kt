@@ -18,7 +18,7 @@ interface AMQPChannel {
     val state: ConnectionState
 
     /**
-     * A deferred that completes when the channek is closed.
+     * A deferred that completes when the channel is closed.
      */
     val channelClosed: Deferred<AMQPException.ChannelClosed>
 

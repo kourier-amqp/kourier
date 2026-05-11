@@ -213,12 +213,15 @@ class AMQPChannelTest {
 
             try {
                 val body = ByteArray(frameMax) { 'A'.code.toByte() }
+                val confirm = async(start = CoroutineStart.UNDISPATCHED) {
+                    channel.publishConfirmResponses.first()
+                }
                 channel.basicPublish {
                     this.body = body
                     exchange = ""
                     routingKey = queueName
                 }
-                channel.publishConfirmResponses.first()
+                confirm.await()
 
                 val msg = channel.basicGet {
                     queue = queueName
@@ -248,12 +251,15 @@ class AMQPChannelTest {
 
             try {
                 val body = ByteArray(frameMax - 1) { 'A'.code.toByte() }
+                val confirm = async(start = CoroutineStart.UNDISPATCHED) {
+                    channel.publishConfirmResponses.first()
+                }
                 channel.basicPublish {
                     this.body = body
                     exchange = ""
                     routingKey = queueName
                 }
-                channel.publishConfirmResponses.first()
+                confirm.await()
 
                 val msg = channel.basicGet {
                     queue = queueName
@@ -283,12 +289,15 @@ class AMQPChannelTest {
 
             try {
                 val body = ByteArray(frameMax + 1) { 'A'.code.toByte() }
+                val confirm = async(start = CoroutineStart.UNDISPATCHED) {
+                    channel.publishConfirmResponses.first()
+                }
                 channel.basicPublish {
                     this.body = body
                     exchange = ""
                     routingKey = queueName
                 }
-                channel.publishConfirmResponses.first()
+                confirm.await()
 
                 val msg = channel.basicGet {
                     queue = queueName
@@ -318,12 +327,15 @@ class AMQPChannelTest {
 
             try {
                 val body = ByteArray(2 * frameMax) { 'A'.code.toByte() }
+                val confirm = async(start = CoroutineStart.UNDISPATCHED) {
+                    channel.publishConfirmResponses.first()
+                }
                 channel.basicPublish {
                     this.body = body
                     exchange = ""
                     routingKey = queueName
                 }
-                channel.publishConfirmResponses.first()
+                confirm.await()
 
                 val msg = channel.basicGet {
                     queue = queueName
@@ -353,12 +365,15 @@ class AMQPChannelTest {
 
             try {
                 val body = ByteArray(2 * frameMax - 1) { 'A'.code.toByte() }
+                val confirm = async(start = CoroutineStart.UNDISPATCHED) {
+                    channel.publishConfirmResponses.first()
+                }
                 channel.basicPublish {
                     this.body = body
                     exchange = ""
                     routingKey = queueName
                 }
-                channel.publishConfirmResponses.first()
+                confirm.await()
 
                 val msg = channel.basicGet {
                     queue = queueName
@@ -388,12 +403,15 @@ class AMQPChannelTest {
 
             try {
                 val body = ByteArray(2 * frameMax + 1) { 'A'.code.toByte() }
+                val confirm = async(start = CoroutineStart.UNDISPATCHED) {
+                    channel.publishConfirmResponses.first()
+                }
                 channel.basicPublish {
                     this.body = body
                     exchange = ""
                     routingKey = queueName
                 }
-                channel.publishConfirmResponses.first()
+                confirm.await()
 
                 val msg = channel.basicGet {
                     queue = queueName
@@ -445,6 +463,9 @@ class AMQPChannelTest {
             channel.confirmSelect()
 
             try {
+                val confirm = async(start = CoroutineStart.UNDISPATCHED) {
+                    channel.publishConfirmResponses.first()
+                }
                 channel.basicPublish {
                     this.body = body
                     exchange = ""
@@ -453,7 +474,7 @@ class AMQPChannelTest {
                 }
                 // Wait for the broker's publish-confirm so the message is guaranteed enqueued
                 // before basicGet() runs. See testBasicPublish for the timing rationale.
-                channel.publishConfirmResponses.first()
+                confirm.await()
 
                 val msg = channel.basicGet {
                     queue = queueName
@@ -486,12 +507,15 @@ class AMQPChannelTest {
 
             try {
                 val body = "".toByteArray()
+                val confirm = async(start = CoroutineStart.UNDISPATCHED) {
+                    channel.publishConfirmResponses.first()
+                }
                 channel.basicPublish {
                     this.body = body
                     exchange = ""
                     routingKey = queueName
                 }
-                channel.publishConfirmResponses.first()
+                confirm.await()
 
                 val msg = channel.basicGet {
                     queue = queueName

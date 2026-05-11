@@ -50,6 +50,14 @@ class PublisherConfirmsTest {
                 for (i in 1..messageCount) {
                     val message = "Message $i"
 
+                    // Subscribe to confirms BEFORE publishing — replay=0 SharedFlow drops
+                    // emissions made while subscriberCount=0, so a fast broker Ack arriving
+                    // before .first() subscribed would be lost. UNDISPATCHED wires the
+                    // subscription synchronously before async returns.
+                    val confirmDeferred = async(start = CoroutineStart.UNDISPATCHED) {
+                        channel.publishConfirmResponses.first()
+                    }
+
                     // Publish message
                     channel.basicPublish(
                         message.toByteArray(),
@@ -58,8 +66,7 @@ class PublisherConfirmsTest {
                         properties = Properties()
                     )
 
-                    // Wait for confirm
-                    val confirm = channel.publishConfirmResponses.first()
+                    val confirm = confirmDeferred.await()
 
                     when (confirm) {
                         is AMQPResponse.Channel.Basic.PublishConfirm.Ack -> {
