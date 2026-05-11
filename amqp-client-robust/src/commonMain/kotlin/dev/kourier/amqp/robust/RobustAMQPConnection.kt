@@ -90,13 +90,21 @@ open class RobustAMQPConnection(
         var retryDelay = initialDelay
         while (!connectionClosed.isCompleted) {
             iterationClosed = CompletableDeferred()
+            // Snapshot the channels to restore BEFORE openConnection(). super.connect() emits
+            // Connection.Connected as soon as Connection.OpenOk is received, which can resume a
+            // user awaiting `connection.openedResponses.first()` and let them call
+            // `connection.openChannel()`. That new channel would land in channels.list() before
+            // the restore loop reads it, causing both the user's openChannel and a phantom restore
+            // to send Channel.Open concurrently — the broker rejects the second one with
+            // CHANNEL_ERROR "second 'channel.open' seen" (504) and tears down the connection.
+            val channelsToRestore = channels.list().filterIsInstance<RobustAMQPChannel>()
             try {
                 openConnection()
                 // Restore channels concurrently — sequential restore would make the worst-case
                 // wall-clock per iteration N * restoreTimeout when each channel has to time out.
                 // super.connect() must complete before any channel restore (single shared socket).
                 coroutineScope {
-                    channels.list().filterIsInstance<RobustAMQPChannel>().forEach { channel ->
+                    channelsToRestore.forEach { channel ->
                         launch {
                             try {
                                 channel.restore()
