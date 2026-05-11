@@ -120,9 +120,17 @@ open class DefaultAMQPChannel(
 
     open suspend fun cancelAll(channelClosed: AMQPException.ChannelClosed) {
         if (state == ConnectionState.CLOSED) return // Already closed
-        this.state = ConnectionState.CLOSED
+        // Complete the channelClosed deferred BEFORE flipping state to CLOSED. Reason: the
+        // RobustAMQPChannel.basicConsume listener wrapper uses `state == SHUTTING_DOWN ||
+        // channelClosed.isCompleted` to decide whether a Channel.Closed event is terminal (and
+        // therefore worth forwarding to the user's onCanceled). If we set state=CLOSED first,
+        // there's a window where state has moved past SHUTTING_DOWN but channelClosed isn't
+        // completed yet — the wrapper sees both as false and incorrectly skips onCanceled,
+        // leaving the consumer's produce-channel open. Completing the deferred first preserves
+        // the monotonic guarantee documented in the wrapper.
         logger.debug("Channel $id closed: ${channelClosed.replyText} (${channelClosed.replyCode})")
         this@DefaultAMQPChannel.channelClosed.complete(channelClosed)
+        this.state = ConnectionState.CLOSED
         // Snapshot then join: listener coroutines self-cancel upon receiving Channel.Closed,
         // but their `onCanceled` callbacks (e.g. closing a produce channel) run AFTER the
         // SharedFlow emit returned to close()'s writeAndWaitForResponse. Joining here makes
