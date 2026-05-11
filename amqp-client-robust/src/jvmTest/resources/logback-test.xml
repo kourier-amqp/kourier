@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Enables debug output from kourier's loggers during JVM tests. The library uses
+    KtorSimpleLogger which delegates to SLF4J — logback picks up this config because
+    logback-classic is on the jvmTest classpath.
+
+    With this config the test output shows every "Sent AMQP frame: ..." / "Received AMQP
+    frame: ..." emitted by the library, which is essential for diagnosing the broker-vs-
+    client frame race conditions surfaced by tests like RobustAMQPConnectionTest.
+
+    Keep root at WARN so we don't drown in noise from coroutines / ktor internals.
+-->
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{20} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="AMQPConnection" level="DEBUG"/>
+    <logger name="AMQPChannel" level="DEBUG"/>
+    <logger name="PartialDelivery" level="DEBUG"/>
+
+    <root level="WARN">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>

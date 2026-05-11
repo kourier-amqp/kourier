@@ -12,9 +12,6 @@ jobs:
       rabbitmq:
         image: rabbitmq:4.1
         ports: [ "5672:5672" ]
-        env:
-          RABBITMQ_LOGS: "-" # log to stdout
-          RABBITMQ_LOG_LEVEL: debug
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,7 +20,9 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: 21
-      - name: Install dependencies and run tests
+      - name: Install dependencies
+        run: ./gradlew allMetadataJar
+      - name: Run tests (with info logging)
         run: ./gradlew jvmTest koverXmlReport --info # switch to `build` later when native tests are fixed (coroutine cancellation is not working in native tests)
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5

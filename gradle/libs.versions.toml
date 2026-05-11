@@ -11,6 +11,7 @@ opentelemetry-semconv = "1.34.0"
 kotlinx-coroutines = "1.10.2"
 kotlinx-io = "0.7.0"
 kotlinx-serialization = "1.8.1"
+logback = "1.5.13"
 
 [plugins]
 multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
@@ -31,3 +32,4 @@ opentelemetry-api = { group = "io.opentelemetry", name = "opentelemetry-api", ve
 opentelemetry-context = { group = "io.opentelemetry", name = "opentelemetry-context", version.ref = "opentelemetry" }
 opentelemetry-extension-kotlin = { group = "io.opentelemetry", name = "opentelemetry-extension-kotlin", version.ref = "opentelemetry" }
 opentelemetry-semconv = { group = "io.opentelemetry.semconv", name = "opentelemetry-semconv", version.ref = "opentelemetry-semconv" }
+logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }

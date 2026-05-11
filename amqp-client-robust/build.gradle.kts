@@ -65,6 +65,10 @@ kotlin {
         testRuns.named("test") {
             executionTask.configure {
                 useJUnitPlatform()
+                testLogging {
+                    showStandardStreams = true
+                    events("standardOut", "standardError")
+                }
             }
         }
     }
@@ -88,6 +92,14 @@ kotlin {
             dependencies {
                 implementation(kotlin("test"))
                 implementation(libs.kotlinx.coroutines.test)
+            }
+        }
+        val jvmTest by getting {
+            dependencies {
+                // Brings in an SLF4J implementation so the library's KtorSimpleLogger debug
+                // output (frame send/receive) actually prints during JVM test runs. Without
+                // a binding, ktor's logger swallows everything.
+                implementation(libs.logback.classic)
             }
         }
     }
