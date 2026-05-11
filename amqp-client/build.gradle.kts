@@ -65,6 +65,10 @@ kotlin {
         testRuns.named("test") {
             executionTask.configure {
                 useJUnitPlatform()
+                testLogging {
+                    showStandardStreams = true
+                    events("standardOut", "standardError")
+                }
             }
         }
     }
@@ -90,6 +94,11 @@ kotlin {
             dependencies {
                 implementation(kotlin("test"))
                 implementation(libs.kotlinx.coroutines.test)
+            }
+        }
+        val jvmTest by getting {
+            dependencies {
+                implementation(libs.logback.classic)
             }
         }
     }

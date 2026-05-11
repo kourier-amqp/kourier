@@ -2,11 +2,8 @@ package dev.kourier.amqp.channel
 
 import dev.kourier.amqp.*
 import io.ktor.utils.io.core.*
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.test.runTest
@@ -174,18 +171,21 @@ class AMQPChannelTest {
             val body = "{}".toByteArray()
 
             try {
+                // Subscribe to publishConfirmResponses BEFORE publishing — replay=0 SharedFlow
+                // drops emissions made while subscriberCount=0, so a fast broker Ack arriving
+                // before .first() subscribed would be lost and the await would hang forever.
+                // UNDISPATCHED runs the async body up to the first suspension synchronously,
+                // wiring the SharedFlow subscriber before async returns.
+                val confirm = async(start = CoroutineStart.UNDISPATCHED) {
+                    channel.publishConfirmResponses.first()
+                }
                 val result = channel.basicPublish {
                     this.body = body
                     exchange = ""
                     routingKey = queueName
                 }
                 assertEquals(1u, result.deliveryTag)
-
-                // Wait for the broker's publish-confirm so the message is guaranteed enqueued
-                // before messageCount() reads. On a fast loopback the round-trip is much longer
-                // than the time between basicPublish() returning and .first() subscribing, so
-                // the SharedFlow's replay=0 doesn't lose the confirm in practice.
-                channel.publishConfirmResponses.first()
+                confirm.await()
 
                 val messageCount = channel.messageCount(queueName)
                 assertEquals(1u, messageCount)

@@ -42,6 +42,10 @@ kotlin {
         testRuns.named("test") {
             executionTask.configure {
                 useJUnitPlatform()
+                testLogging {
+                    showStandardStreams = true
+                    events("standardOut", "standardError")
+                }
             }
         }
     }
@@ -68,6 +72,7 @@ kotlin {
                 implementation("io.opentelemetry:opentelemetry-sdk-testing:1.44.1")
                 implementation("org.junit.jupiter:junit-jupiter-api:5.10.0")
                 runtimeOnly("org.junit.jupiter:junit-jupiter-engine:5.10.0")
+                implementation(libs.logback.classic)
             }
         }
     }
