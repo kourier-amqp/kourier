@@ -157,6 +157,13 @@ open class DefaultAMQPConnection(
         heartbeatSubscription = messageListeningScope.launch {
             while (isActive) {
                 delay(heartbeat.toInt().seconds.inWholeMilliseconds / 2)
+                // Skip the periodic heartbeat once the connection has begun shutting down.
+                // close() cancels this job before sending Connection.Close, but a tick that has
+                // already passed `delay` would otherwise still call sendHeartbeat() and push a
+                // frame onto the wire after Close — the broker treats that as `unexpected_frame:
+                // "type 8"`, floods its logs, and can spike latency for unrelated in-flight ops.
+                // The state check here keeps the public sendHeartbeat() API throw-on-closed.
+                if (state != ConnectionState.OPEN) continue
                 sendHeartbeat()
             }
         }
@@ -523,6 +530,16 @@ open class DefaultAMQPConnection(
     ): AMQPResponse.Connection.Closed {
         if (state != ConnectionState.OPEN) return AMQPResponse.Connection.Closed
         this.state = ConnectionState.SHUTTING_DOWN
+        // Stop the heartbeat ticker before sending Connection.Close: once the broker has processed
+        // Close it considers the connection terminal and treats any subsequent heartbeat frame as
+        // an `unexpected_frame: "type 8"` connection-level exception. That race floods the broker
+        // logs with spurious errors and, more importantly, can spike broker latency enough to make
+        // unrelated in-flight ops (like a concurrent channel restore) hit their timeout.
+        // cancelAndJoin (not just cancel) so any in-flight sendHeartbeat() completes before we
+        // start writing the Close frame — otherwise a heartbeat already past its state check
+        // would still slip onto the wire after Close.
+        heartbeatSubscription?.cancelAndJoin()
+        heartbeatSubscription = null
         val close = Frame(
             channelId = 0u,
             payload = Frame.Method.Connection.Close(
