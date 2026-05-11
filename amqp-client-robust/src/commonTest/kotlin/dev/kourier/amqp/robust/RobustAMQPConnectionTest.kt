@@ -30,8 +30,8 @@ class RobustAMQPConnectionTest {
     @Test
     fun testConnectionDrops() = runTest {
         withConnection { connection ->
-            val closeEvent = async { connection.closedResponses.first() }
-            val reopenEvent = async { connection.openedResponses.first() }
+            val closeEvent = async(start = CoroutineStart.UNDISPATCHED) { connection.closedResponses.first() }
+            val reopenEvent = async(start = CoroutineStart.UNDISPATCHED) { connection.openedResponses.first() }
 
             // Write invalid frame to close connection (heartbeat frame is only allowed on channel 0)
             connection.write(
@@ -54,8 +54,8 @@ class RobustAMQPConnectionTest {
     fun testRestoreConsumeAfterConnectionDrops() = runTest {
         withConnection { connection ->
             val channel = connection.openChannel()
-            val closeEvent = async { connection.closedResponses.first() }
-            val reopenEvent = async { channel.openedResponses.first() }
+            val closeEvent = async(start = CoroutineStart.UNDISPATCHED) { connection.closedResponses.first() }
+            val reopenEvent = async(start = CoroutineStart.UNDISPATCHED) { channel.openedResponses.first() }
 
             val queueName = "test-connection-restore-queue"
             val exchange = "test-connection-restore-exchange"
@@ -108,8 +108,8 @@ class RobustAMQPConnectionTest {
     fun testRestoreConsumeNoTaAfterConnectionDrops() = runTest {
         withConnection { connection ->
             val channel = connection.openChannel()
-            val closeEvent = async { connection.closedResponses.first() }
-            val reopenEvent = async { channel.openedResponses.first() }
+            val closeEvent = async(start = CoroutineStart.UNDISPATCHED) { connection.closedResponses.first() }
+            val reopenEvent = async(start = CoroutineStart.UNDISPATCHED) { channel.openedResponses.first() }
 
             val queueName = "test-connection-restore-queue"
             val exchange = "test-connection-restore-exchange"
@@ -173,8 +173,8 @@ class RobustAMQPConnectionTest {
     fun testRestoreMultipleBrokerAssignedConsumersAfterConnectionDrop() = runTest {
         withConnection { connection ->
             val channel = connection.openChannel()
-            val closeEvent = async { connection.closedResponses.first() }
-            val reopenEvent = async { channel.openedResponses.first() }
+            val closeEvent = async(start = CoroutineStart.UNDISPATCHED) { connection.closedResponses.first() }
+            val reopenEvent = async(start = CoroutineStart.UNDISPATCHED) { channel.openedResponses.first() }
 
             val queue1 = "test-multi-consumer-conn-${Uuid.random()}"
             val queue2 = "test-multi-consumer-conn-${Uuid.random()}"

@@ -17,13 +17,16 @@ fun Any?.toField(): Field =
         null -> Field.Null
         is Field -> this
         is Boolean -> Field.Boolean(this)
+        // Int / UInt / Long come before Byte / Short on purpose: on Kotlin/JS, range-based
+        // `is` checks for narrow integer types match any in-range number, so `42 is Byte` is
+        // `true` and would otherwise mask `is Int` and produce Field.Byte for plain integers.
+        is Int -> Field.Int(this)
+        is UInt -> Field.UInt(this)
+        is Long -> Field.Long(this)
         is Byte -> Field.Byte(this)
         is UByte -> Field.UByte(this)
         is Short -> Field.Short(this)
         is UShort -> Field.UShort(this)
-        is Int -> Field.Int(this)
-        is UInt -> Field.UInt(this)
-        is Long -> Field.Long(this)
         is Float -> Field.Float(this)
         is Double -> Field.Double(this)
         is String -> Field.LongString(this)

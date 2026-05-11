@@ -72,13 +72,7 @@ private class BackoffCountingConnection(
     public fun publicForceReconnect() = forceReconnect()
 }
 
-/**
- * No-stack-trace exception. The tight reconnect loop (pre-fix) would otherwise allocate
- * a stack trace per attempt and OOM the JVM before assertions can run.
- */
-private class SimulatedConnectFailure(message: String) : RuntimeException(message) {
-    override fun fillInStackTrace(): Throwable = this
-}
+private class SimulatedConnectFailure(message: String) : RuntimeException(message)
 
 class ReconnectBackoffTest {
 

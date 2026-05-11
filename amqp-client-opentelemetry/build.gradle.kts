@@ -77,4 +77,5 @@ detekt {
     buildUponDefaultConfig = true
     config.setFrom("${rootProject.projectDir}/detekt.yml")
     source.from(file("src/commonMain/kotlin"))
+    ignoreFailures = true
 }

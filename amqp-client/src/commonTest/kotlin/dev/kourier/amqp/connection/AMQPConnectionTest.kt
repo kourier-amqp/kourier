@@ -4,6 +4,7 @@ import dev.kourier.amqp.AMQPException
 import dev.kourier.amqp.Frame
 import dev.kourier.amqp.withConnection
 import io.ktor.http.*
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
@@ -63,7 +64,7 @@ class AMQPConnectionTest {
     @Test
     fun testConnectionDrops() = runTest {
         withConnection { connection ->
-            val closeEvent = async { connection.closedResponses.first() }
+            val closeEvent = async(start = CoroutineStart.UNDISPATCHED) { connection.closedResponses.first() }
 
             // Write invalid frame to close connection (heartbeat frame is only allowed on channel 0)
             connection.write(
