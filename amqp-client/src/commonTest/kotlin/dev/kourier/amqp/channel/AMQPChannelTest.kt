@@ -625,8 +625,13 @@ class AMQPChannelTest {
                 // Subscribe BEFORE publishing so we don't miss confirms that fire between
                 // basicPublish() returning and our collector attaching. publishConfirmResponses
                 // is a SharedFlow with replay=0 — late subscribers drop emissions.
+                // CoroutineStart.UNDISPATCHED runs the launch body synchronously on the current
+                // thread up to the first real suspension point — `collect` subscribes
+                // synchronously before suspending, so the subscriber is wired before `launch`
+                // returns and any Ack frame the broker sends post-publish lands on a live
+                // subscriber.
                 val confirmed = CompletableDeferred<Unit>()
-                val confirmJob = launch {
+                val confirmJob = launch(start = CoroutineStart.UNDISPATCHED) {
                     var resolved = 0uL
                     channel.publishConfirmResponses.collect { confirm ->
                         resolved = maxOf(resolved, confirm.deliveryTag)
@@ -712,7 +717,8 @@ class AMQPChannelTest {
 
             channel.confirmSelect {}
 
-            val confirmJob = launch {
+            // UNDISPATCHED: same subscribe-before-publish rationale as the first confirmJob site.
+            val confirmJob = launch(start = CoroutineStart.UNDISPATCHED) {
                 val mutex = Mutex()
                 var count = 1
                 channel.publishConfirmResponses.collect {

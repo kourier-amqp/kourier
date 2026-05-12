@@ -124,7 +124,7 @@ class PublisherConfirmsTest {
                 var nackCount = 0
                 var resolvedTags = 0uL
                 val allConfirmed = CompletableDeferred<Unit>()
-                val confirmJob = launch {
+                val confirmJob = launch(start = CoroutineStart.UNDISPATCHED) {
                     channel.publishConfirmResponses.collect { confirm ->
                         when (confirm) {
                             is AMQPResponse.Channel.Basic.PublishConfirm.Ack -> ackCount++
@@ -219,7 +219,7 @@ class PublisherConfirmsTest {
                 // CompletableDeferred (cleaner than throwing CancellationException out of collect,
                 // which can race with runTest's leak detector on slow CI hosts).
                 val allConfirmed = CompletableDeferred<Unit>()
-                val confirmJob = launch {
+                val confirmJob = launch(start = CoroutineStart.UNDISPATCHED) {
                     channel.publishConfirmResponses.collect { confirm ->
                         when (confirm) {
                             is AMQPResponse.Channel.Basic.PublishConfirm.Ack -> {
@@ -311,7 +311,7 @@ class PublisherConfirmsTest {
                 // Subscribe BEFORE publishing so an Ack(multiple=true) covering several pending publishes
                 // — which is one emission, not `messageCount` emissions — does not leave us waiting.
                 val allConfirmed = CompletableDeferred<Unit>()
-                val confirmJob = launch {
+                val confirmJob = launch(start = CoroutineStart.UNDISPATCHED) {
                     var resolvedTags = 0uL
                     channel.publishConfirmResponses.collect { confirm ->
                         confirms += confirm
