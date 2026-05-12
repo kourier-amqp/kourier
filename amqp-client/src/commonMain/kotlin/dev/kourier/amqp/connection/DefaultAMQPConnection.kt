@@ -71,6 +71,16 @@ open class DefaultAMQPConnection(
     // don't double-fire the SHUTTING_DOWN -> CLOSED path; the gate inside is "skip if terminal".
     private val closeMutex = Mutex()
 
+    // Dedicated child scope for broker-Channel.Close-triggered cancelAll launches so we can
+    // cancel them wholesale when the connection is terminated. Without this, a restore() whose
+    // socket has just been closed keeps ticking until its `withTimeout(restoreTimeout)` fires
+    // inside an unrelated later test/operation, surfacing as a phantom RestoreTimeoutException
+    // that the test framework attributes to whichever test was active when the timer fired.
+    // SupervisorJob so a failure in one channel's restore doesn't cascade-cancel the others.
+    private val brokerCloseRestoresScope: CoroutineScope = CoroutineScope(
+        messageListeningScope.coroutineContext + SupervisorJob(messageListeningScope.coroutineContext[Job])
+    )
+
     private var channelMax: UShort = 0u
     private var frameMax: UInt = 0u
     private var heartbeat: UShort = 60u
@@ -299,9 +309,22 @@ open class DefaultAMQPConnection(
                         )
                     )
                     if (channel.shouldRemoveOnBrokerClose()) channels.remove(channel.id)
-                    // Trigger restoration asynchronously (for RobustAMQPChannel, this will restore)
-                    messageListeningScope.launch {
-                        channel.cancelAll(exception)
+                    // Launch in brokerCloseRestoresScope so cancelAll() can cancel all in-flight
+                    // restores wholesale when the connection terminates — otherwise a restore()
+                    // running on a now-dead socket would tick until its withTimeout fires inside
+                    // an unrelated later test, surfacing as a phantom RestoreTimeoutException.
+                    // Swallow non-cancellation exceptions: cancelAll() races with the restore's
+                    // in-flight writeAndWaitForResponse — when the writeChannel is cancelled
+                    // before our cancellation signal arrives, the restore's write() throws
+                    // IOException, which would otherwise propagate up as uncaught.
+                    brokerCloseRestoresScope.launch {
+                        try {
+                            channel.cancelAll(exception)
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            logger.debug("Broker-close-triggered restore aborted: ${e.message}")
+                        }
                     }
                 }
             }
@@ -578,6 +601,12 @@ open class DefaultAMQPConnection(
         socket?.close()
         readChannel?.cancel()
         writeChannel?.cancel(IOException())
+
+        // Cancel any in-flight broker-Channel.Close-triggered restore launches. Their socket
+        // is now dead, so their writeAndWaitForResponse `.first()` would otherwise hang until
+        // withTimeout(restoreTimeout) fires — long after the connection is gone, leaking a
+        // RestoreTimeoutException into whatever test happens to be running by then.
+        brokerCloseRestoresScope.cancel()
 
         socketSubscription = null
         heartbeatSubscription = null

@@ -44,8 +44,18 @@ open class DefaultAMQPChannel(
     // observe the consumer's `onCanceled` side effects (e.g. closing a produce channel)
     // before close() returns, instead of racing the listener coroutine on Dispatchers.Default.
     // Guarded by listeningJobsMutex; jobs auto-deregister via invokeOnCompletion.
+    //
+    // `listeningJobsByConsumer` (broker-assigned consumerTag -> listeningJob) lets
+    // `basicCancel(consumerTag)` join the specific consumer's listener after CancelOk
+    // arrives, so the user's `onCanceled` callback has run by the time basicCancel returns.
+    // Without this, basicCancel races the listener's `channelResponses.collect{}` on the
+    // same Channel.Basic.Canceled emission — both fire concurrently, basicCancel returns
+    // before the listener calls onCanceled, and a caller immediately observing side
+    // effects (e.g. `assertTrue(receiveChannel.isClosedForReceive)`) can see them
+    // as not-yet-applied.
     private val listeningJobsMutex = Mutex()
     private val listeningJobs = mutableSetOf<Job>()
+    private val listeningJobsByConsumer = mutableMapOf<String, Job>()
 
     override val channelClosed = CompletableDeferred<AMQPException.ChannelClosed>()
 
@@ -340,7 +350,13 @@ open class DefaultAMQPChannel(
             // invokeOnCompletion runs on the completing coroutine context; use launch to avoid
             // requiring suspend semantics here (mutex.withLock requires suspension).
             connection.messageListeningScope.launch {
-                listeningJobsMutex.withLock { listeningJobs.remove(listeningJob) }
+                listeningJobsMutex.withLock {
+                    listeningJobs.remove(listeningJob)
+                    // Also drop any per-consumer-tag entry pointing at this job. We don't know
+                    // the tag here (registration is by-value), so scan; the map is small (one
+                    // entry per active consumer on the channel).
+                    listeningJobsByConsumer.entries.removeAll { it.value === listeningJob }
+                }
             }
         }
         deferredListeningJob.complete(listeningJob)
@@ -359,6 +375,8 @@ open class DefaultAMQPChannel(
         )
         val result = writeAndWaitForResponse<AMQPResponse.Channel.Basic.ConsumeOk>(consume)
         deferredConsumerTag.complete(result.consumerTag)
+        // Index by broker-confirmed consumerTag so basicCancel can join the right listener.
+        listeningJobsMutex.withLock { listeningJobsByConsumer[result.consumerTag] = listeningJob }
         logger.debug("Consumer ${result.consumerTag} on channel $id started")
         return result
     }
@@ -373,7 +391,17 @@ open class DefaultAMQPChannel(
                 noWait = false
             )
         )
-        return writeAndWaitForResponse(cancel)
+        val result = writeAndWaitForResponse<AMQPResponse.Channel.Basic.Canceled>(cancel)
+        // Wait for the listening job to fully process the Channel.Basic.Canceled emission —
+        // which is what invokes user's onCanceled (e.g. closes the receive channel of the
+        // convenience basicConsume(...) -> AMQPReceiveChannel overload). Without this join,
+        // basicCancel races the listener's collect{} on the same SharedFlow emission and
+        // returns first, so callers immediately observing side effects can see them as not
+        // yet applied. The listener self-cancels inside its Channel.Basic.Canceled handler
+        // (after calling onCanceled), so `join()` returns as soon as that branch finishes.
+        val listener = listeningJobsMutex.withLock { listeningJobsByConsumer.remove(consumerTag) }
+        listener?.join()
+        return result
     }
 
     override suspend fun basicAck(
