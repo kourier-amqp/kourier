@@ -15,7 +15,7 @@ import kotlin.test.*
 class AMQPConnectionTest {
 
     @Test
-    fun testConnectionWithUrl(): Unit = runTest {
+    fun testConnectionWithUrl() = runTest {
         withContext(Dispatchers.Default) {
             val urlString = "amqp://guest:guest@localhost:5672/"
             createAMQPConnection(this, urlString).close()
