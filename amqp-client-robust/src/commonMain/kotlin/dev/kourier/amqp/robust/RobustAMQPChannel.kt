@@ -18,6 +18,20 @@ open class RobustAMQPChannel(
 
     private var restoreCompleted = CompletableDeferred(Unit)
 
+    // Deduplicates concurrent broker-`Channel.Close`-triggered restore attempts. A single
+    // broker close fires *two* `cancelAll(channelClosed)` paths: (a) the read loop's
+    // `messageListeningScope.launch { channel.cancelAll(exception) }`, and (b) the
+    // synchronous `.also { cancelAll(it) }` inside `writeAndWaitForResponse` for any
+    // in-flight RPC whose `.first()` filter caught the same `Channel.Closed` emission.
+    // Without dedup, both call `prepareForRestore()` (which resets `state = CLOSED`) — so
+    // even after one restore has set `state = OPEN` post-`open()`, the other's
+    // `prepareForRestore()` re-flips it to CLOSED and its `open()` sends `Channel.Open`
+    // AGAIN. The broker then closes the *connection* with CHANNEL_ERROR 504
+    // "second 'channel.open' seen". `tryLock` lets only one restore run per close event;
+    // any concurrent caller skips silently — the channel state ends up correctly restored
+    // by the winning path.
+    private val restoreLatch = Mutex()
+
     // Adjusted delivery tag tracking (similar to Java client's RecoveryAwareChannelN):
     // Each restore increments deliveryTagOffset by the highest broker tag seen in that epoch,
     // making adjusted tags globally monotonically increasing across restores so that stale
@@ -129,8 +143,17 @@ open class RobustAMQPChannel(
         // If the connection itself is not open, connectionFactory() will restore this channel;
         // attempting a channel-level restore here would race with that.
         if (connection.state != ConnectionState.OPEN) return
-        logger.debug("Channel $id closed, attempting to restore...")
-        restore()
+        // Dedup concurrent restore triggers from the same Channel.Close event (read-loop
+        // launch + in-flight RPC's `writeAndWaitForResponse.also { cancelAll(it) }`).
+        // `tryLock` returns false if another restore is already running — we silently
+        // skip; the in-progress restore will complete the state transition for us.
+        if (!restoreLatch.tryLock()) return
+        try {
+            logger.debug("Channel $id closed, attempting to restore...")
+            restore()
+        } finally {
+            restoreLatch.unlock()
+        }
     }
 
     override suspend fun basicQos(count: UShort, global: Boolean): AMQPResponse.Channel.Basic.QosOk {
