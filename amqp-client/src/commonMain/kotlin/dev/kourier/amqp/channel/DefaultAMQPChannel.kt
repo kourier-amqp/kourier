@@ -275,16 +275,28 @@ open class DefaultAMQPChannel(
             )
             deferredConsumeOk.complete(consumeOk)
             awaitClose {
-                runBlocking {
-                    if (state != ConnectionState.OPEN) return@runBlocking
-                    val cancel = Frame(
-                        channelId = id,
-                        payload = Frame.Method.Basic.Cancel(
-                            consumerTag = consumeOk.consumerTag,
-                            noWait = true
+                // awaitClose's block is not a suspend context. The previous code used
+                // runBlocking to call the suspending write(), which blocks the calling thread
+                // — it can deadlock when the receive channel is closed on a small dispatcher
+                // pool, and is unsupported on Kotlin/JS entirely. Send the Basic.Cancel as a
+                // fire-and-forget launch on the connection scope instead, gated on the channel
+                // still being open (the broker drops consumers automatically on channel close).
+                connection.messageListeningScope.launch {
+                    try {
+                        if (state != ConnectionState.OPEN) return@launch
+                        val cancel = Frame(
+                            channelId = id,
+                            payload = Frame.Method.Basic.Cancel(
+                                consumerTag = consumeOk.consumerTag,
+                                noWait = true
+                            )
                         )
-                    )
-                    write(cancel)
+                        write(cancel)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        logger.debug("Failed to send Basic.Cancel for consumer ${consumeOk.consumerTag} on channel $id: ${e.message}")
+                    }
                 }
             }
         }
@@ -315,15 +327,20 @@ open class DefaultAMQPChannel(
                     val consumerTag = deferredConsumerTag.await()
                     when (response) {
                         is AMQPResponse.Channel.Closed -> {
-                            deferredListeningJob.await().cancel()
                             logger.debug("Consumer $consumerTag on channel $id canceled due to channel closed")
+                            // Run the user's onCanceled BEFORE cancelling our own job. Cancelling
+                            // first puts this coroutine into the cancelling state, so the suspending
+                            // onCanceled would throw at its first suspension point and the user's
+                            // cleanup (closing a session, completing a deferred, closing the produce
+                            // channel) would silently not run.
                             onCanceled(response)
+                            deferredListeningJob.await().cancel()
                         }
 
                         is AMQPResponse.Channel.Basic.Canceled -> if (response.consumerTag == consumerTag) {
-                            deferredListeningJob.await().cancel()
                             logger.debug("Consumer $consumerTag on channel $id canceled")
                             onCanceled(response)
+                            deferredListeningJob.await().cancel()
                         }
 
                         is AMQPResponse.Channel.Message.Delivery -> if (response.consumerTag == consumerTag) launch {

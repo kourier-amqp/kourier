@@ -1039,4 +1039,100 @@ class AMQPChannelTest {
         }
     }
 
+    // ISSUE-7: the consumer listener used to cancel its own listening job BEFORE invoking
+    // onCanceled. Since onCanceled runs inside that job, cancelling first put the coroutine
+    // into the cancelling state, so any suspension inside onCanceled threw CancellationException
+    // and the user's cleanup silently did not run. onCanceled must complete first.
+    @Test
+    fun testOnCanceledCompletesBeforeBasicCancelReturns() = runTest {
+        withConnection { connection ->
+            val channel = connection.openChannel()
+            val queueName = "test-oncanceled-cancel-${Uuid.random()}"
+            channel.queueDeclare {
+                name = queueName
+                durable = false
+                exclusive = true
+            }
+            try {
+                // onCanceled suspends (delay) before recording completion. basicCancel joins the
+                // listener, so by the time it returns the user's onCanceled must have finished.
+                val cleanupDone = CompletableDeferred<Unit>()
+                val consumeOk = channel.basicConsume(
+                    queue = queueName,
+                    onDelivery = { },
+                    onCanceled = {
+                        delay(50)
+                        cleanupDone.complete(Unit)
+                    }
+                )
+                channel.basicCancel(consumeOk.consumerTag)
+                assertTrue(
+                    cleanupDone.isCompleted,
+                    "onCanceled must run to completion before basicCancel returns"
+                )
+            } finally {
+                runCatching { channel.close() }
+            }
+        }
+    }
+
+    // ISSUE-7 (channel-close path): the same ordering bug applied to the listener's
+    // Channel.Closed branch. close() joins the listener (NEW-13), so a suspending onCanceled
+    // must run to completion before close() returns.
+    @Test
+    fun testOnCanceledCompletesOnChannelClose() = runTest {
+        withConnection { connection ->
+            val channel = connection.openChannel()
+            val queueName = "test-oncanceled-close-${Uuid.random()}"
+            channel.queueDeclare {
+                name = queueName
+                durable = false
+                exclusive = true
+            }
+            val cleanupDone = CompletableDeferred<Unit>()
+            channel.basicConsume(
+                queue = queueName,
+                onDelivery = { },
+                onCanceled = {
+                    delay(50)
+                    cleanupDone.complete(Unit)
+                }
+            )
+            channel.close()
+            assertTrue(
+                cleanupDone.isCompleted,
+                "onCanceled must run to completion before channel.close() returns"
+            )
+        }
+    }
+
+    // ISSUE-1: cancelling the receive channel triggers awaitClose, which must send Basic.Cancel
+    // without blocking the calling thread (the old code used runBlocking, which can deadlock on
+    // constrained dispatchers and is unsupported on JS). Polling the broker until the consumer
+    // disappears proves the cancel was actually sent; the bounded withTimeout fails fast on a hang.
+    @Test
+    fun testReceiveChannelCancelSendsBasicCancel() = runTest {
+        withConnection { connection ->
+            val channel = connection.openChannel()
+            val queueName = "test-receive-cancel-${Uuid.random()}"
+            channel.queueDeclare {
+                name = queueName
+                durable = false
+                exclusive = true
+            }
+            try {
+                val deliveryChannel = channel.basicConsume(queue = queueName, noAck = true)
+                assertEquals(1u, channel.consumerCount(queueName))
+
+                deliveryChannel.cancel()
+                withTimeout(5000) {
+                    while (channel.consumerCount(queueName) != 0u) delay(20)
+                }
+                assertEquals(0u, channel.consumerCount(queueName))
+            } finally {
+                runCatching { channel.close() }
+            }
+        }
+    }
+
 }
