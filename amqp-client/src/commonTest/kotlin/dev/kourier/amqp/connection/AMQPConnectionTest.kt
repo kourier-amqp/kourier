@@ -7,9 +7,11 @@ import io.ktor.http.*
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlin.test.*
 
 class AMQPConnectionTest {
@@ -97,6 +99,69 @@ class AMQPConnectionTest {
             } finally {
                 connection.close()
                 fakeServer.serverJob.cancel()
+            }
+        }
+    }
+
+    // NEW-2: the broker advertises a 1s heartbeat then goes silent. Per AMQP 0.9.1 the client
+    // must treat the connection as dead after 2 * heartbeat with no frame received, so
+    // connectionClosed completes (which is what drives robust reconnect). Without the watchdog
+    // the read loop blocks on readAvailable() forever and this never completes.
+    @Test
+    fun testMissedServerHeartbeatsClosesConnection() = runTest {
+        withContext(Dispatchers.Default) {
+            val fakeServer = FakeServer(
+                this,
+                heartbeat = 1u,
+                behavior = FakeServer.Behavior.StaySilent,
+                port = 5674,
+            )
+            fakeServer.serverReady.await()
+            val connection = createAMQPConnection(this) {
+                server { port = 5674 }
+            }
+            try {
+                val closed = withTimeout(8000) { connection.connectionClosed.await() }
+                assertTrue(
+                    closed.replyText?.contains("heartbeat", ignoreCase = true) == true,
+                    "expected a missed-heartbeat close, got: ${closed.replyText}"
+                )
+            } finally {
+                connection.close()
+                fakeServer.serverJob.cancel()
+            }
+        }
+    }
+
+    // NEW-11: a negotiated heartbeat of 0 disables heart-beating. The client must NOT start the
+    // watchdog (a 2 * 0 = 0s timeout would mark the connection dead instantly) nor a delay(0)
+    // busy-spin sender. The connection must stay open.
+    @Test
+    fun testZeroHeartbeatDisablesWatchdog() = runTest {
+        withContext(Dispatchers.Default) {
+            val fakeServer = FakeServer(
+                this,
+                heartbeat = 0u,
+                behavior = FakeServer.Behavior.StaySilent,
+                port = 5675,
+            )
+            fakeServer.serverReady.await()
+            val connection = createAMQPConnection(this) {
+                server { port = 5675 }
+            }
+            try {
+                // Give a wrongly-started watchdog ample time to misfire.
+                delay(3000)
+                assertFalse(
+                    connection.connectionClosed.isCompleted,
+                    "connection must stay open when heartbeat is disabled (0)"
+                )
+            } finally {
+                // The silent server never answers Connection.Close, so a graceful close() would
+                // block on CloseOk. Drop the server socket first (tears down the client read loop)
+                // and time-box the close as a safety net.
+                fakeServer.serverJob.cancel()
+                runCatching { withTimeout(2000) { connection.close() } }
             }
         }
     }

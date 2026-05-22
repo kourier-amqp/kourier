@@ -20,6 +20,7 @@ import kotlinx.io.IOException
 import kotlinx.serialization.encodeToByteArray
 import kotlin.concurrent.Volatile
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeSource
 
 open class DefaultAMQPConnection(
     override val config: AMQPConfig,
@@ -59,6 +60,17 @@ open class DefaultAMQPConnection(
 
     protected var socketSubscription: Job? = null
     protected var heartbeatSubscription: Job? = null
+
+    // Watchdog that detects missed *server* heartbeats. AMQP 0.9.1: if no frame (heartbeat or
+    // otherwise) is received for 2 * heartbeat, the peer is considered dead. Without this, a
+    // silently-vanished broker (cable pulled, NAT timeout, kernel panic) leaves the read loop
+    // blocked on readAvailable() forever and the robust connection never reconnects.
+    protected var heartbeatWatchdogSubscription: Job? = null
+
+    // Monotonic timestamp of the last frame received from the broker; updated by the read loop
+    // and read by the watchdog. @Volatile for cross-coroutine visibility (same pattern as state).
+    @Volatile
+    private var lastFrameReceivedAt = TimeSource.Monotonic.markNow()
 
     private val writeMutex = Mutex()
 
@@ -153,10 +165,16 @@ open class DefaultAMQPConnection(
     protected open fun startListening() {
         socketSubscription?.cancel()
         heartbeatSubscription?.cancel()
+        heartbeatWatchdogSubscription?.cancel()
+        // The heartbeat sender + watchdog are (re)started from the Tune handler once the broker's
+        // heartbeat interval is negotiated — they can't run here because the interval is unknown
+        // until Tune, and a negotiated 0 means heart-beating is disabled (no sender, no watchdog).
         socketSubscription = messageListeningScope.launch {
             val readChannel = this@DefaultAMQPConnection.readChannel ?: return@launch
             try {
                 FrameDecoder.decodeStreaming(readChannel) { frame ->
+                    // Any received frame (including heartbeats) resets the missed-heartbeat clock.
+                    lastFrameReceivedAt = TimeSource.Monotonic.markNow()
                     logger.debug("Received AMQP frame: $frame")
                     read(frame)
                 }
@@ -168,17 +186,49 @@ open class DefaultAMQPConnection(
                 closeFromChannelException(e)
             }
         }
+    }
+
+    /**
+     * (Re)starts the heartbeat sender and the missed-heartbeat watchdog using the broker-negotiated
+     * interval. Called from the [Frame.Method.Connection.Tune] handler. A negotiated value of 0
+     * disables heart-beating entirely (per AMQP 0.9.1) — neither job is started, which avoids both
+     * a `delay(0)` busy-spin in the sender and a watchdog whose `2 * 0 = 0` timeout would treat the
+     * connection as instantly dead.
+     */
+    protected open fun startHeartbeat(negotiatedHeartbeat: UShort) {
+        heartbeatSubscription?.cancel()
+        heartbeatWatchdogSubscription?.cancel()
+        if (negotiatedHeartbeat.toUInt() == 0u) {
+            logger.debug("Heartbeat disabled (negotiated 0); skipping heartbeat sender and watchdog")
+            return
+        }
+        val interval = negotiatedHeartbeat.toInt().seconds
+        // Reset the clock so the gap before the connection became OPEN isn't counted as silence.
+        lastFrameReceivedAt = TimeSource.Monotonic.markNow()
         heartbeatSubscription = messageListeningScope.launch {
             while (isActive) {
-                delay(heartbeat.toInt().seconds.inWholeMilliseconds / 2)
+                delay(interval / 2)
                 // Skip the periodic heartbeat once the connection has begun shutting down.
                 // close() cancels this job before sending Connection.Close, but a tick that has
                 // already passed `delay` would otherwise still call sendHeartbeat() and push a
                 // frame onto the wire after Close — the broker treats that as `unexpected_frame:
                 // "type 8"`, floods its logs, and can spike latency for unrelated in-flight ops.
-                // The state check here keeps the public sendHeartbeat() API throw-on-closed.
                 if (state != ConnectionState.OPEN) continue
                 sendHeartbeat()
+            }
+        }
+        val timeout = interval * 2
+        heartbeatWatchdogSubscription = messageListeningScope.launch {
+            while (isActive) {
+                delay(interval / 2)
+                if (state != ConnectionState.OPEN) continue
+                if (lastFrameReceivedAt.elapsedNow() > timeout) {
+                    logger.debug("No frame received for >${timeout}; treating connection as dead")
+                    closeFromChannelException(
+                        IOException("Missed server heartbeats (interval = ${negotiatedHeartbeat}s)")
+                    )
+                    return@launch
+                }
             }
         }
     }
@@ -243,6 +293,8 @@ open class DefaultAMQPConnection(
                 )
                 write(tuneOk)
                 write(open)
+                // Start (or restart, on reconnect) heart-beating now that the interval is known.
+                startHeartbeat(payload.heartbeat)
             }
 
             is Frame.Method.Connection.TuneOk -> error("Unexpected TuneOk frame received: $payload")
@@ -577,6 +629,8 @@ open class DefaultAMQPConnection(
         // would still slip onto the wire after Close.
         heartbeatSubscription?.cancelAndJoin()
         heartbeatSubscription = null
+        heartbeatWatchdogSubscription?.cancel()
+        heartbeatWatchdogSubscription = null
         val close = Frame(
             channelId = 0u,
             payload = Frame.Method.Connection.Close(
@@ -602,6 +656,7 @@ open class DefaultAMQPConnection(
 
         socketSubscription?.cancel()
         heartbeatSubscription?.cancel()
+        heartbeatWatchdogSubscription?.cancel()
         socket?.close()
         readChannel?.cancel()
         writeChannel?.cancel(IOException())
@@ -614,6 +669,7 @@ open class DefaultAMQPConnection(
 
         socketSubscription = null
         heartbeatSubscription = null
+        heartbeatWatchdogSubscription = null
         socket = null
         readChannel = null
         writeChannel = null

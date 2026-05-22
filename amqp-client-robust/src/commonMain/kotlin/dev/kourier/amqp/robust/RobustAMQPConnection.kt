@@ -162,12 +162,14 @@ open class RobustAMQPConnection(
         socket?.close()
         socket = null
 
-        // The heartbeat job ticks against the now-dead socket until super.connect() restarts.
-        // Cancel it so it doesn't leak; startListening() relaunches it on reconnect.
-        // Do NOT cancel socketSubscription: the read loop is already exiting via the catch
-        // that brought us here.
+        // The heartbeat sender + watchdog tick against the now-dead socket until reconnect.
+        // Cancel them so they don't leak; startHeartbeat() (called from the Tune handler on
+        // reconnect) relaunches them. Do NOT cancel socketSubscription: the read loop is
+        // already exiting via the catch that brought us here.
         heartbeatSubscription?.cancel()
         heartbeatSubscription = null
+        heartbeatWatchdogSubscription?.cancel()
+        heartbeatWatchdogSubscription = null
 
         // Wake up any per-channel writers blocked on writeAndWaitForResponse{...}.first().
         // Without this, mid-flight calls (channel.open(), exchangeDeclare(), basicQos(), ...)
