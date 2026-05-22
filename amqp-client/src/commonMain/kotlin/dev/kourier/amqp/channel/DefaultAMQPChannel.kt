@@ -307,7 +307,11 @@ open class DefaultAMQPChannel(
         val deferredListeningJob = CompletableDeferred<Job>()
         val listeningJob = connection.messageListeningScope.launch {
             channelResponses.collect { response ->
-                runCatching { // Catch to avoid cancelling messageListeningScope
+                // Catch to avoid cancelling messageListeningScope on a user-callback failure,
+                // but rethrow CancellationException so this job's own cancellation propagates
+                // (deferredListeningJob.cancel() below, and cancelAll() joining this job, both
+                // rely on cancellation actually stopping the collector).
+                try {
                     val consumerTag = deferredConsumerTag.await()
                     when (response) {
                         is AMQPResponse.Channel.Closed -> {
@@ -323,21 +327,25 @@ open class DefaultAMQPChannel(
                         }
 
                         is AMQPResponse.Channel.Message.Delivery -> if (response.consumerTag == consumerTag) launch {
-                            runCatching {
+                            try {
                                 logger.debug("Consumer $consumerTag on channel $id received delivery ${response.message.deliveryTag}")
                                 onDelivery(response)
-                            }.onFailure { exception ->
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Throwable) {
                                 logger.error(
                                     "Error processing delivery ${response.message.deliveryTag} on channel $id",
-                                    exception
+                                    e
                                 )
                             }
                         }
 
                         else -> {} // Ignore other responses
                     }
-                }.onFailure { exception ->
-                    logger.error("Error in consumer $consumerTag on channel $id", exception)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    logger.error("Error in consumer $consumerTag on channel $id", e)
                 }
             }
         }

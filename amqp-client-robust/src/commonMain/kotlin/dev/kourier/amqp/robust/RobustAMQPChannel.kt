@@ -4,6 +4,7 @@ import dev.kourier.amqp.*
 import dev.kourier.amqp.channel.*
 import dev.kourier.amqp.connection.ConnectionState
 import dev.kourier.amqp.states.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.sync.Mutex
@@ -117,6 +118,14 @@ open class RobustAMQPChannel(
             // Throw a regular Exception (not CancellationException) so connectionFactory()
             // logs and iterates rather than cancelling the recovery coroutine.
             throw timeoutException
+        } catch (e: CancellationException) {
+            // Genuine cancellation (e.g. the connection was torn down, or cancelAll()
+            // cancelled brokerCloseRestoresScope mid-restore) — distinct from the
+            // TimeoutCancellationException case above. Unblock awaiting writers, then rethrow:
+            // cooperative cancellation must propagate, never be swallowed. Handled explicitly
+            // (rather than relying on the generic catch below) so this intent survives edits.
+            restoreCompleted.completeExceptionally(e)
+            throw e
         } catch (e: Exception) {
             restoreCompleted.completeExceptionally(e)
             throw e

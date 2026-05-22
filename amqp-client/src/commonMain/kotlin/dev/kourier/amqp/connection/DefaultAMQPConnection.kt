@@ -160,6 +160,10 @@ open class DefaultAMQPConnection(
                     logger.debug("Received AMQP frame: $frame")
                     read(frame)
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Normal shutdown cancels socketSubscription; let it propagate rather than
+                // routing it through the broker/IO-failure close path.
+                throw e
             } catch (e: Exception) {
                 closeFromChannelException(e)
             }
