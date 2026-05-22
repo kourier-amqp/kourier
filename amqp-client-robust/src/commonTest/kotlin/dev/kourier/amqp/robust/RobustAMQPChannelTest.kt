@@ -646,4 +646,30 @@ class RobustAMQPChannelTest {
         }
     }
 
+    // NEW-5: confirm mode must be re-enabled after a restore. Before the fix, restore() did not
+    // re-issue confirmSelect(), so the reopened broker channel was not in confirm mode and never
+    // sent Basic.Ack — any caller awaiting a publish confirm hung forever.
+    @Test
+    @OptIn(DelicateCoroutinesApi::class)
+    fun testConfirmModeReenabledAfterRestore() = runTest {
+        withConnection { connection ->
+            val channel = connection.openChannel()
+            channel.confirmSelect()
+
+            val closeEvent = async(start = CoroutineStart.UNDISPATCHED) { channel.closedResponses.first() }
+            val reopenEvent = async(start = CoroutineStart.UNDISPATCHED) { channel.openedResponses.first() }
+            channel.closeByBreaking()
+            closeEvent.await()
+            reopenEvent.await()
+
+            // Subscribe before publishing (publishConfirmResponses is a replay=0 SharedFlow). With
+            // confirm mode correctly re-enabled the broker acks the publish; otherwise this hangs.
+            val confirm = async(start = CoroutineStart.UNDISPATCHED) { channel.publishConfirmResponses.first() }
+            channel.basicPublish("after restore".toByteArray(), "", "test-confirm-${Uuid.random()}")
+            withTimeout(5.seconds) { confirm.await() }
+
+            channel.close()
+        }
+    }
+
 }

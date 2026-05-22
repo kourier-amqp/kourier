@@ -43,6 +43,14 @@ open class RobustAMQPChannel(
     private var deliveryTagOffsetBeforeRestore: ULong = 0u
     private var maxBrokerTagInCurrentEpoch: ULong = 0u
 
+    // Durable record of whether the *user* asked for confirm/tx mode, kept separate from the
+    // base `isConfirmMode`/`isTxMode` flags. Those base flags track the *current broker channel's*
+    // state and are reset by prepareForRestore() (a freshly-reopened channel is not in confirm/tx
+    // mode until we re-issue the select). These intent flags survive restores so the mode is
+    // re-established on every reconnect — never reset once the user enabled it.
+    private var confirmModeRequested = false
+    private var txModeRequested = false
+
     private var declaredQos: DeclaredQos? = null
     internal val declaredExchanges = mutableMapOf<String, DeclaredExchange>()
     internal val declaredQueues = mutableMapOf<String, DeclaredQueue>()
@@ -68,6 +76,12 @@ open class RobustAMQPChannel(
         deliveryTagOffsetBeforeRestore = deliveryTagOffset
         maxBrokerTagInCurrentEpoch = 0u
         state = ConnectionState.CLOSED
+        // The freshly-reopened broker channel is NOT in confirm/tx mode; clear the base flags so
+        // restore()'s re-issued confirmSelect()/txSelect() actually send the frame (they early-return
+        // if the flag is already set). The durable confirmModeRequested/txModeRequested intent flags
+        // are untouched, so the mode is re-established below.
+        isConfirmMode = false
+        isTxMode = false
     }
 
     @InternalAmqpApi
@@ -78,6 +92,13 @@ open class RobustAMQPChannel(
             // Bound restore so a non-replying broker can't hang every writer on the channel forever.
             withTimeout(connection.config.server.restoreTimeout) {
                 open()
+
+                // Re-establish confirm/tx mode before anything is published on the new channel.
+                // Without this, basicPublish keeps returning a deliveryTag (isConfirmMode is set
+                // again below) but the broker, no longer in confirm mode, never sends Basic.Ack —
+                // so any caller awaiting a publish confirm hangs forever.
+                if (confirmModeRequested) confirmSelect()
+                if (txModeRequested) txSelect()
 
                 declaredQos?.let { basicQos(it) }
                 if (restoreTopology) {
@@ -394,6 +415,15 @@ open class RobustAMQPChannel(
             return
         }
         super.basicReject(brokerTag, requeue)
+    }
+
+    override suspend fun confirmSelect(): AMQPResponse.Channel.Confirm.Selected {
+        // Record the user's intent durably so restore() re-enables confirm mode on every reconnect.
+        return super.confirmSelect().also { confirmModeRequested = true }
+    }
+
+    override suspend fun txSelect(): AMQPResponse.Channel.Tx.Selected {
+        return super.txSelect().also { txModeRequested = true }
     }
 
 }
