@@ -98,20 +98,28 @@ open class DefaultAMQPChannel(
         if (channelClosed.isCompleted) throw channelClosed.await()
         prepareForWrite()
         val firstResponse = writeMutex.withLock { // Ensure the response is synchronized with the write operation
-            // Subscribe BEFORE writing: `channelResponses` is a SharedFlow with replay=0,
-            // so any response emitted before our subscription would be lost. `onSubscription`
-            // must be applied directly to the SharedFlow (it isn't defined for plain Flow),
-            // so attach it first and filter afterwards. The action runs only after the
-            // subscription is fully wired up.
-            //
-            // Call `connection.write` directly (not the virtual `write`) so an overridden
-            // `write` in a subclass (e.g. RobustAMQPChannel awaiting restoreCompleted) can't
-            // re-enter the mutex chain and deadlock against an in-progress restore. The
-            // pre-mutex `prepareForWrite()` hook handles any required wait state.
-            channelResponses
-                .onSubscription { connection.write(*frames) }
-                .filter { it is T || it is AMQPResponse.Channel.Closed }
-                .first()
+            // Bound the wait so a stalled / black-holed broker can't suspend the caller forever
+            // (the only other escape paths are a broker Channel.Close or external cancellation).
+            // The timeout wraps only the write + response wait, inside the mutex — not the lock
+            // acquisition — so being queued behind another RPC doesn't count against it. The
+            // pre-mutex prepareForWrite() (which on RobustAMQPChannel may await an in-progress
+            // restore, itself bounded by restoreTimeout) is likewise outside this timeout.
+            withTimeoutOrNull(connection.config.server.rpcTimeout) {
+                // Subscribe BEFORE writing: `channelResponses` is a SharedFlow with replay=0,
+                // so any response emitted before our subscription would be lost. `onSubscription`
+                // must be applied directly to the SharedFlow (it isn't defined for plain Flow),
+                // so attach it first and filter afterwards. The action runs only after the
+                // subscription is fully wired up.
+                //
+                // Call `connection.write` directly (not the virtual `write`) so an overridden
+                // `write` in a subclass (e.g. RobustAMQPChannel awaiting restoreCompleted) can't
+                // re-enter the mutex chain and deadlock against an in-progress restore. The
+                // pre-mutex `prepareForWrite()` hook handles any required wait state.
+                channelResponses
+                    .onSubscription { connection.write(*frames) }
+                    .filter { it is T || it is AMQPResponse.Channel.Closed }
+                    .first()
+            } ?: throw AMQPException.RpcTimeout(channelId = id, timeout = connection.config.server.rpcTimeout)
         }
         if (firstResponse is T) return firstResponse
         if (firstResponse is AMQPResponse.Channel.Closed) throw AMQPException.ChannelClosed(

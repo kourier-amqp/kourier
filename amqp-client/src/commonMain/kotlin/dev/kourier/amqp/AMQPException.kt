@@ -1,8 +1,22 @@
 package dev.kourier.amqp
 
 import kotlinx.io.IOException
+import kotlin.time.Duration
 
 sealed class AMQPException : IOException() {
+
+    /**
+     * A channel-level RPC (queueDeclare, basicGet, confirmSelect, …) did not receive a response
+     * within the configured `rpcTimeout`. Prevents a stalled/black-holed broker from suspending
+     * the caller forever. Not a [kotlinx.coroutines.CancellationException], so robust recovery
+     * treats it as a normal failure.
+     */
+    data class RpcTimeout(
+        val channelId: ChannelId,
+        val timeout: Duration,
+    ) : AMQPException() {
+        override val message: String get() = "RPC on channel $channelId timed out after $timeout"
+    }
 
     data object InvalidUrl : AMQPException()
 

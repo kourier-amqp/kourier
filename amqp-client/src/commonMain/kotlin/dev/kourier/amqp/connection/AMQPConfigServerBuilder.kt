@@ -10,6 +10,7 @@ class AMQPConfigServerBuilder {
     var password: String = AMQPConfig.Server.Defaults.PASSWORD
     var vhost: String = AMQPConfig.Server.Defaults.VHOST
     var timeout: Duration = AMQPConfig.Server.Defaults.timeout
+    var rpcTimeout: Duration = AMQPConfig.Server.Defaults.rpcTimeout
     var connectionName: String = AMQPConfig.Server.Defaults.CONNECTION_NAME
     var restoreTimeout: Duration = AMQPConfig.Server.Defaults.restoreTimeout
     var restoreTopology: Boolean = AMQPConfig.Server.Defaults.RESTORE_TOPOLOGY
@@ -25,6 +26,7 @@ class AMQPConfigServerBuilder {
             password = password,
             vhost = vhost,
             timeout = timeout,
+            rpcTimeout = rpcTimeout,
             connectionName = connectionName,
             restoreTimeout = restoreTimeout,
             restoreTopology = restoreTopology,

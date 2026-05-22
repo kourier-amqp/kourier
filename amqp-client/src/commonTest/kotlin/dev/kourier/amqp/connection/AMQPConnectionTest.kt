@@ -13,6 +13,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlin.test.*
+import kotlin.time.Duration.Companion.seconds
 
 class AMQPConnectionTest {
 
@@ -160,6 +161,35 @@ class AMQPConnectionTest {
                 // The silent server never answers Connection.Close, so a graceful close() would
                 // block on CloseOk. Drop the server socket first (tears down the client read loop)
                 // and time-box the close as a safety net.
+                fakeServer.serverJob.cancel()
+                runCatching { withTimeout(2000) { connection.close() } }
+            }
+        }
+    }
+
+    // ISSUE-3: a channel-level RPC must not hang forever when the broker stalls. The server here
+    // completes the connection handshake then goes silent; openChannel() sends Channel.Open and
+    // waits for OpenOk that never arrives, so it must throw RpcTimeout once rpcTimeout elapses.
+    @Test
+    fun testRpcTimesOutWhenBrokerStalls() = runTest {
+        withContext(Dispatchers.Default) {
+            val fakeServer = FakeServer(
+                this,
+                behavior = FakeServer.Behavior.StaySilent,
+                port = 5676,
+            )
+            fakeServer.serverReady.await()
+            val connection = createAMQPConnection(this) {
+                server {
+                    port = 5676
+                    rpcTimeout = 2.seconds
+                }
+            }
+            try {
+                assertFailsWith<AMQPException.RpcTimeout> {
+                    withTimeout(8000) { connection.openChannel() }
+                }
+            } finally {
                 fakeServer.serverJob.cancel()
                 runCatching { withTimeout(2000) { connection.close() } }
             }
