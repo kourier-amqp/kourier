@@ -34,6 +34,9 @@ open class DefaultAMQPConnection(
         // one yet still blocks an oversized-frame DoS during the handshake.
         private const val HANDSHAKE_FRAME_MAX: Long = 1L shl 20
 
+        // AMQP framing overhead per frame: 7-byte header (type + channel + size) + 1-byte end marker.
+        private const val FRAME_OVERHEAD: Long = 8
+
         /**
          * Connect to broker.
          *
@@ -238,11 +241,13 @@ open class DefaultAMQPConnection(
         }
     }
 
-    // Max size (bytes) a single incoming frame may advertise. After Tune we use the negotiated
-    // frameMax; before it (only small handshake frames arrive), fall back to a generous bound so
-    // the size check is active from the very first frame without rejecting a legitimate Start/Tune.
+    // Max payload size (bytes) a single incoming frame may advertise. AMQP's negotiated frameMax is
+    // the *total* frame size, so the payload bound is frameMax minus the 8-byte framing overhead
+    // (7-byte header + 1-byte end marker). After Tune we use the negotiated frameMax; before it
+    // (only small handshake frames arrive), fall back to a generous bound so the size check is
+    // active from the very first frame without rejecting a legitimate Start/Tune.
     private fun maxReceivableFrameSize(): Long =
-        frameMax.toLong().takeIf { it > 0 } ?: HANDSHAKE_FRAME_MAX
+        (frameMax.toLong().takeIf { it > 0 } ?: HANDSHAKE_FRAME_MAX) - FRAME_OVERHEAD
 
     private suspend fun read(frame: Frame) {
         val channel = channels[frame.channelId] as? DefaultAMQPChannel

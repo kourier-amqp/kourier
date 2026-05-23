@@ -74,6 +74,12 @@ object FrameSerializer : KSerializer<Frame> {
             throw ProtocolError.Invalid(size, "Frame size $size exceeds maximum ${decoder.maxFrameSize}", this)
         }
 
+        // Method/Header frames decode *structurally*, not by raw byte count, so a `size` that
+        // disagrees with the real payload length would otherwise leave the stream desynced (and the
+        // end-marker check at a shifted offset). Measure what the payload decode actually consumed
+        // and require it to equal the declared size. (BODY consumes exactly `size` by construction;
+        // HEARTBEAT consumes 0, so this also enforces a 0-size heartbeat.)
+        val remainingBefore = decoder.buffer.size
         val result = when (kind) {
             Frame.Kind.METHOD -> {
                 val payload = decoder.decodeSerializableValue(FrameMethodSerializer)
@@ -91,6 +97,10 @@ object FrameSerializer : KSerializer<Frame> {
             }
 
             Frame.Kind.HEARTBEAT -> Frame(channelId, Frame.Heartbeat)
+        }
+        val consumed = remainingBefore - decoder.buffer.size
+        if (consumed != size.toLong()) {
+            throw ProtocolError.Invalid(size, "Frame payload consumed $consumed bytes but declared size is $size", this)
         }
 
         val endMarker = decoder.decodeByte().toUByte()

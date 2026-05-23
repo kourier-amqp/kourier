@@ -944,4 +944,24 @@ class FrameTest {
         assertEquals(100, (frame.payload as Frame.Body).body.size)
     }
 
+    // NEW-29: a Method/Header frame whose declared size overstates its real payload must be rejected
+    // (ProtocolError.Invalid), not silently accepted with the stream left desynced.
+    @Test
+    fun testMethodFrameWithOverstatedSizeIsRejected() {
+        val bytes = ProtocolBinary.encodeToByteArray(Frame(channelId = 1u, payload = Frame.Method.Basic.QosOk))
+
+        // The 4-byte big-endian size is at indices 3..6. QosOk's real payload is small (4 bytes:
+        // classId + methodId), so bumping the low byte makes the declared size overstate it.
+        val tampered = bytes.copyOf()
+        tampered[6] = (tampered[6] + 4).toByte()
+
+        assertFailsWith<ProtocolError.Invalid> {
+            ProtocolBinaryDecoder(Buffer().apply { write(tampered) })
+                .decodeSerializableValue(FrameSerializer)
+        }
+
+        // Sanity: the untampered frame still decodes fine.
+        ProtocolBinaryDecoder(Buffer().apply { write(bytes) }).decodeSerializableValue(FrameSerializer)
+    }
+
 }

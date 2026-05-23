@@ -18,6 +18,10 @@ open class DefaultAMQPChannel(
     override val id: ChannelId,
     val frameMax: UInt,
 ) : AMQPChannel {
+    companion object {
+        // AMQP framing overhead per frame: 7-byte header (type + channel + size) + 1-byte end marker.
+        private const val FRAME_OVERHEAD = 8
+    }
 
     protected val logger = KtorSimpleLogger("AMQPChannel")
 
@@ -223,13 +227,17 @@ open class DefaultAMQPChannel(
         val payloads = mutableListOf<Frame.Payload>()
         payloads.add(publish)
         payloads.add(header)
+        // Each body frame's total wire size is its payload plus 8 bytes of framing (7-byte header +
+        // 1-byte end marker) and must not exceed the negotiated frameMax — so the max body payload
+        // per frame is frameMax - 8.
+        val maxBodyPayload = frameMax.toInt() - FRAME_OVERHEAD
         when {
             body.isEmpty() -> {} // Do not send body
-            body.size <= frameMax.toInt() -> payloads.add(Frame.Body(body)) // Send all at once
+            body.size <= maxBodyPayload -> payloads.add(Frame.Body(body)) // Send all at once
             else -> { // Split body into multiple frames
                 var offset = 0
                 while (offset < body.size) {
-                    val length = minOf(frameMax.toInt(), body.size - offset)
+                    val length = minOf(maxBodyPayload, body.size - offset)
                     val slice = body.copyOfRange(offset, offset + length)
                     payloads.add(Frame.Body(slice))
                     offset += length
