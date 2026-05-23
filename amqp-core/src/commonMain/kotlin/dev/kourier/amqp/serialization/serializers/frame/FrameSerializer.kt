@@ -64,7 +64,15 @@ object FrameSerializer : KSerializer<Frame> {
             Frame.Kind.entries.first { it.value == byte }
         }
         val channelId = decoder.decodeShort().toUShort()
-        val size = decoder.decodeInt().toULong()
+        // The wire size is an unsigned 32-bit int. Validate it BEFORE allocating/reading: an
+        // out-of-range size (a malicious 4 GiB advertisement, or a value whose high bit makes
+        // size.toInt() wrap negative) would otherwise drive a giant allocation or an undefined
+        // read. Reject anything larger than the negotiated frameMax. Throwing ProtocolError.Invalid
+        // (not Incomplete) makes the streaming decoder propagate it and close the connection.
+        val size = decoder.decodeInt().toUInt()
+        if (size.toLong() > decoder.maxFrameSize) {
+            throw ProtocolError.Invalid(size, "Frame size $size exceeds maximum ${decoder.maxFrameSize}", this)
+        }
 
         val result = when (kind) {
             Frame.Kind.METHOD -> {

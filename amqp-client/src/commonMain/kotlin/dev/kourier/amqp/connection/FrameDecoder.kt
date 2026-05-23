@@ -13,6 +13,9 @@ object FrameDecoder {
 
     suspend fun decodeStreaming(
         channel: ByteReadChannel,
+        // Resolved per decode attempt so it picks up the broker-negotiated frameMax after Tune
+        // (a fresh decoder is created each iteration). Bounds the size a single frame may advertise.
+        maxFrameSize: () -> Long = { Long.MAX_VALUE },
         onItem: suspend (Frame) -> Unit,
     ) {
         var buffer = Buffer()
@@ -30,7 +33,7 @@ object FrameDecoder {
                 val snapshot = buffer.readBytes()
                 val workingBuffer = Buffer().apply { write(snapshot) }
 
-                val decoder = ProtocolBinaryDecoder(workingBuffer)
+                val decoder = ProtocolBinaryDecoder(workingBuffer, maxFrameSize())
 
                 try {
                     val value = decoder.decodeSerializableValue(FrameSerializer)

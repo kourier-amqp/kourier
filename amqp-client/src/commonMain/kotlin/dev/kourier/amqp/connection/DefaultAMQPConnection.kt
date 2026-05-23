@@ -29,6 +29,11 @@ open class DefaultAMQPConnection(
 
     companion object {
 
+        // Frame-size ceiling applied before the broker negotiates frameMax in Tune. Only small
+        // handshake frames (Start, Tune) arrive in that window; 1 MiB is far above any legitimate
+        // one yet still blocks an oversized-frame DoS during the handshake.
+        private const val HANDSHAKE_FRAME_MAX: Long = 1L shl 20
+
         /**
          * Connect to broker.
          *
@@ -172,7 +177,7 @@ open class DefaultAMQPConnection(
         socketSubscription = messageListeningScope.launch {
             val readChannel = this@DefaultAMQPConnection.readChannel ?: return@launch
             try {
-                FrameDecoder.decodeStreaming(readChannel) { frame ->
+                FrameDecoder.decodeStreaming(readChannel, maxFrameSize = ::maxReceivableFrameSize) { frame ->
                     // Any received frame (including heartbeats) resets the missed-heartbeat clock.
                     lastFrameReceivedAt = TimeSource.Monotonic.markNow()
                     logger.debug("Received AMQP frame: $frame")
@@ -232,6 +237,12 @@ open class DefaultAMQPConnection(
             }
         }
     }
+
+    // Max size (bytes) a single incoming frame may advertise. After Tune we use the negotiated
+    // frameMax; before it (only small handshake frames arrive), fall back to a generous bound so
+    // the size check is active from the very first frame without rejecting a legitimate Start/Tune.
+    private fun maxReceivableFrameSize(): Long =
+        frameMax.toLong().takeIf { it > 0 } ?: HANDSHAKE_FRAME_MAX
 
     private suspend fun read(frame: Frame) {
         val channel = channels[frame.channelId] as? DefaultAMQPChannel

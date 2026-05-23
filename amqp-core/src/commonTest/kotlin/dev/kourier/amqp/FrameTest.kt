@@ -1,10 +1,15 @@
 package dev.kourier.amqp
 
 import dev.kourier.amqp.serialization.ProtocolBinary
+import dev.kourier.amqp.serialization.ProtocolBinaryDecoder
+import dev.kourier.amqp.serialization.serializers.frame.FrameSerializer
+import kotlinx.io.Buffer
+import kotlinx.io.write
 import kotlinx.serialization.decodeFromByteArray
 import kotlinx.serialization.encodeToByteArray
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 
 class FrameTest {
 
@@ -918,6 +923,25 @@ class FrameTest {
         val encoded = ProtocolBinary.encodeToByteArray(frame)
         val decoded = ProtocolBinary.decodeFromByteArray<Frame>(encoded)
         assertEquals(frame, decoded)
+    }
+
+    // NEW-1: a frame whose declared size exceeds maxFrameSize must be rejected BEFORE allocating,
+    // so a malicious/buggy peer advertising a giant size can't drive an unbounded allocation.
+    @Test
+    fun testFrameExceedingMaxFrameSizeIsRejected() {
+        val body = ByteArray(100) { it.toByte() }
+        val bytes = ProtocolBinary.encodeToByteArray(Frame(channelId = 1u, payload = Frame.Body(body)))
+
+        // Declared size (100) exceeds the 50-byte cap → reject (same branch a 4 GiB size hits).
+        assertFailsWith<ProtocolError.Invalid> {
+            ProtocolBinaryDecoder(Buffer().apply { write(bytes) }, maxFrameSize = 50)
+                .decodeSerializableValue(FrameSerializer)
+        }
+
+        // With a sufficient cap the same frame decodes normally.
+        val frame = ProtocolBinaryDecoder(Buffer().apply { write(bytes) }, maxFrameSize = 1000)
+            .decodeSerializableValue(FrameSerializer)
+        assertEquals(100, (frame.payload as Frame.Body).body.size)
     }
 
 }

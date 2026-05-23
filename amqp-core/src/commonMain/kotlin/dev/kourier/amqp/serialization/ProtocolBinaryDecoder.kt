@@ -13,6 +13,10 @@ import kotlinx.serialization.modules.SerializersModule
 
 class ProtocolBinaryDecoder(
     val buffer: Buffer,
+    // Upper bound (bytes) for a single frame's declared payload size. FrameSerializer rejects any
+    // frame advertising a larger size before allocating, so a malicious/buggy peer can't drive an
+    // unbounded ByteArray allocation (DoS/OOM). Default is unlimited for non-frame decoding.
+    val maxFrameSize: Long = Long.MAX_VALUE,
 ) : Decoder {
 
     override val serializersModule: SerializersModule = EmptySerializersModule()
