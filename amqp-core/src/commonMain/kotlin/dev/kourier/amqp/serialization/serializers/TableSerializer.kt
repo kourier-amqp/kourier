@@ -6,10 +6,10 @@ import dev.kourier.amqp.Table
 import dev.kourier.amqp.serialization.ProtocolBinaryDecoder
 import dev.kourier.amqp.serialization.ProtocolBinaryEncoder
 import kotlinx.io.Buffer
+import kotlinx.io.readByteArray
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.InternalSerializationApi
 import kotlinx.serialization.KSerializer
-import kotlinx.serialization.builtins.ByteArraySerializer
 import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.descriptors.StructureKind
 import kotlinx.serialization.descriptors.buildSerialDescriptor
@@ -71,7 +71,10 @@ object TableSerializer : KSerializer<Table> {
             is Field.Float -> encoder.encodeFloat(field.value)
             is Field.Double -> encoder.encodeDouble(field.value)
             is Field.LongString -> encoder.encodeLongString(field.value)
-            is Field.Bytes -> encoder.encodeSerializableValue(ByteArraySerializer(), field.value)
+            is Field.Bytes -> {
+                encoder.encodeInt(field.value.size)
+                encoder.buffer.write(field.value)
+            }
             is Field.Array -> writeArray(field.value, encoder)
             is Field.Timestamp -> encoder.encodeLong(field.value.toEpochMilliseconds())
             is Field.Table -> encoder.encodeSerializableValue(TableSerializer, field.value)
@@ -185,9 +188,8 @@ object TableSerializer : KSerializer<Table> {
 
             Field.Kind.BYTES -> {
                 val size = decoder.decodeInt()
-                val value = ByteArray(size)
-                decoder.decodeSerializableValue(ByteArraySerializer())
-                Pair(Field.Bytes(value), 1 + size)
+                val value = decoder.buffer.readByteArray(size)
+                Pair(Field.Bytes(value), 1 + 4 + size)
             }
 
             Field.Kind.ARRAY -> {
