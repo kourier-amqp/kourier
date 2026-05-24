@@ -10,6 +10,7 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlin.concurrent.Volatile
 
 open class RobustAMQPChannel(
     override val connection: RobustAMQPConnection,
@@ -32,6 +33,20 @@ open class RobustAMQPChannel(
     // any concurrent caller skips silently — the channel state ends up correctly restored
     // by the winning path.
     private val restoreLatch = Mutex()
+
+    // One-shot restore token. Armed exactly once per broker Channel.Close in onBrokerClose() —
+    // which the read loop calls BEFORE the close is observable to either restore trigger — and
+    // consumed by the first cancelAll under restoreLatch. This makes restore idempotent *per close
+    // event*: restoreLatch.tryLock alone only dedups triggers that overlap in time, but the two
+    // triggers (read-loop launch + in-flight RPC's `.also { cancelAll }`) can also run sequentially,
+    // and a second restore would re-send Channel.Open → broker 504 "second 'channel.open' seen"
+    // → connection teardown (NEW-31).
+    @Volatile
+    private var pendingRestore = false
+
+    override fun onBrokerClose() {
+        pendingRestore = true
+    }
 
     // Adjusted delivery tag tracking (similar to Java client's RecoveryAwareChannelN):
     // Each restore increments deliveryTagOffset by the highest broker tag seen in that epoch,
@@ -179,6 +194,12 @@ open class RobustAMQPChannel(
         // skip; the in-progress restore will complete the state transition for us.
         if (!restoreLatch.tryLock()) return
         try {
+            // Consume the one-shot token armed by onBrokerClose(). The first trigger to win the
+            // latch restores; any later trigger for the SAME close — whether it raced concurrently
+            // (and lost the tryLock) or arrives sequentially after this restore already finished —
+            // finds the token cleared and skips, so we never send a duplicate Channel.Open. (NEW-31)
+            if (!pendingRestore) return
+            pendingRestore = false
             logger.debug("Channel $id closed, attempting to restore...")
             restore()
         } finally {

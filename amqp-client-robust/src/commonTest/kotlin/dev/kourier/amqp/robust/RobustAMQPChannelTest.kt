@@ -672,4 +672,38 @@ class RobustAMQPChannelTest {
         }
     }
 
+    // NEW-31: one broker Channel.Close fires two restore triggers (the read-loop launch and the
+    // in-flight RPC's `.also { cancelAll }`). restoreLatch dedups them only while they OVERLAP; if
+    // the first finishes the restore before the second starts, the second used to re-send
+    // Channel.Open → broker 504 "second 'channel.open' seen" → connection teardown. Here we force
+    // that sequential case deterministically: break the channel, wait for the real restore to
+    // finish, then fire a SECOND restore trigger by hand. With the fix the one-shot token has
+    // already been consumed, so it's a no-op and the channel stays healthy.
+    @Test
+    @OptIn(DelicateCoroutinesApi::class)
+    fun testSequentialDuplicateRestoreTriggerIsNoOp() = runTest {
+        withConnection({ server { restoreTimeout = 2.seconds; rpcTimeout = 2.seconds } }) { connection ->
+            val channel = connection.openChannel() as RobustAMQPChannel
+            val reopenEvent = async(start = CoroutineStart.UNDISPATCHED) { channel.openedResponses.first() }
+
+            channel.closeByBreaking()
+            reopenEvent.await() // the single real restore has reopened the channel
+
+            // Duplicate restore trigger for the SAME close, arriving after restore already completed.
+            channel.cancelAll(
+                AMQPException.ChannelClosed(
+                    replyCode = 406u,
+                    replyText = "duplicate",
+                    isInitiatedByApplication = false,
+                )
+            )
+
+            // With the bug this sent a second Channel.Open and the broker tore down the connection;
+            // with the fix the channel is untouched, so a normal operation still succeeds.
+            val queue = "test-new31-${Uuid.random()}"
+            channel.queueDeclare(queue, durable = false, exclusive = true, autoDelete = true, arguments = emptyMap())
+            channel.close()
+        }
+    }
+
 }

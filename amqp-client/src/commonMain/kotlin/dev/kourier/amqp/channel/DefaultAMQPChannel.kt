@@ -140,6 +140,15 @@ open class DefaultAMQPChannel(
     @InternalAmqpApi
     open fun shouldRemoveOnBrokerClose(): Boolean = true
 
+    /**
+     * Called by the connection read loop when the broker closes this channel, *before* the
+     * `Channel.Closed` event is emitted — so the hook runs before either restore trigger can
+     * observe the close. Base channels don't restore, so this is a no-op; `RobustAMQPChannel`
+     * overrides it to arm a one-shot restore token (see its `cancelAll`).
+     */
+    @InternalAmqpApi
+    open fun onBrokerClose() {}
+
     open suspend fun cancelAll(channelClosed: AMQPException.ChannelClosed) {
         if (state == ConnectionState.CLOSED) return // Already closed
         // Complete the channelClosed deferred BEFORE flipping state to CLOSED. Reason: the

@@ -373,6 +373,10 @@ open class DefaultAMQPConnection(
                         replyText = payload.replyText,
                         isInitiatedByApplication = false
                     )
+                    // Arm restore BEFORE the Channel.Closed is observable, so exactly one restore
+                    // runs per broker close — consumed by the first of the two restore triggers
+                    // (this launch + the in-flight RPC's `.also { cancelAll }`). See NEW-31.
+                    channel.onBrokerClose()
                     channel.channelResponses.emit(
                         AMQPResponse.Channel.Closed(
                             channelId = frame.channelId,
