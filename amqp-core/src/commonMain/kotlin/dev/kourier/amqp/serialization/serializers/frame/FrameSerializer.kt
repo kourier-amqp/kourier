@@ -17,6 +17,11 @@ import kotlinx.serialization.encoding.Encoder
 
 object FrameSerializer : KSerializer<Frame> {
 
+    // Precomputed value -> Kind lookup, so decoding a frame doesn't do a linear scan + lambda
+    // allocation per frame on the inbound hot path (NEW-28). getValue() throws the same
+    // NoSuchElementException the old `entries.first { }` did on an unknown kind.
+    private val kindByValue = Frame.Kind.entries.associateBy { it.value }
+
     @OptIn(InternalSerializationApi::class)
     override val descriptor: SerialDescriptor
         get() = buildSerialDescriptor("Frame", StructureKind.OBJECT)
@@ -32,14 +37,14 @@ object FrameSerializer : KSerializer<Frame> {
                 val innerEncoder = ProtocolBinaryEncoder(Buffer())
                 innerEncoder.encodeSerializableValue(FrameMethodSerializer, payload)
                 encoder.encodeInt(innerEncoder.buffer.size.toInt())
-                innerEncoder.buffer.copyTo(encoder.buffer)
+                encoder.buffer.transferFrom(innerEncoder.buffer)
             }
 
             is Frame.Header -> {
                 val innerEncoder = ProtocolBinaryEncoder(Buffer())
                 innerEncoder.encodeSerializableValue(FrameHeaderSerializer, payload)
                 encoder.encodeInt(innerEncoder.buffer.size.toInt())
-                innerEncoder.buffer.copyTo(encoder.buffer)
+                encoder.buffer.transferFrom(innerEncoder.buffer)
             }
 
             is Frame.Body -> {
@@ -60,9 +65,7 @@ object FrameSerializer : KSerializer<Frame> {
     override fun deserialize(decoder: Decoder): Frame {
         require(decoder is ProtocolBinaryDecoder)
 
-        val kind = decoder.decodeByte().toUByte().let { byte ->
-            Frame.Kind.entries.first { it.value == byte }
-        }
+        val kind = kindByValue.getValue(decoder.decodeByte().toUByte())
         val channelId = decoder.decodeShort().toUShort()
         // The wire size is an unsigned 32-bit int. Validate it BEFORE allocating/reading: an
         // out-of-range size (a malicious 4 GiB advertisement, or a value whose high bit makes

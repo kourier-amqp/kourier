@@ -19,6 +19,10 @@ import kotlin.time.Instant
 
 object TableSerializer : KSerializer<Table> {
 
+    // Precomputed value -> Field.Kind lookup (NEW-28): avoids a linear scan + lambda allocation
+    // per table field decoded. getValue() preserves the old `entries.first { }` failure behavior.
+    private val fieldKindByValue = Field.Kind.entries.associateBy { it.value }
+
     @OptIn(InternalSerializationApi::class)
     override val descriptor: SerialDescriptor
         get() = buildSerialDescriptor("Table", StructureKind.OBJECT)
@@ -40,7 +44,7 @@ object TableSerializer : KSerializer<Table> {
             }
         }
         encoder.encodeInt(innerEncoder.buffer.size.toInt())
-        innerEncoder.buffer.copyTo(encoder.buffer)
+        encoder.buffer.transferFrom(innerEncoder.buffer)
     }
 
     fun writeArray(values: List<Field>, encoder: ProtocolBinaryEncoder) {
@@ -53,7 +57,7 @@ object TableSerializer : KSerializer<Table> {
             }
         }
         encoder.encodeInt(innerEncoder.buffer.size.toInt())
-        innerEncoder.buffer.copyTo(encoder.buffer)
+        encoder.buffer.transferFrom(innerEncoder.buffer)
     }
 
     @OptIn(ExperimentalSerializationApi::class)
@@ -127,9 +131,7 @@ object TableSerializer : KSerializer<Table> {
     }
 
     private fun readField(decoder: ProtocolBinaryDecoder): Pair<Field, Int> {
-        val kind = decoder.decodeByte().toUByte().let { byte ->
-            Field.Kind.entries.first { it.value == byte }
-        }
+        val kind = fieldKindByValue.getValue(decoder.decodeByte().toUByte())
         return when (kind) {
             Field.Kind.BOOLEAN -> {
                 val value = decoder.decodeBoolean()

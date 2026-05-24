@@ -18,6 +18,10 @@ import kotlinx.serialization.encoding.Encoder
 
 object FrameMethodSerializer : KSerializer<Frame.Method> {
 
+    // Precomputed value -> Kind lookup (NEW-28): avoids a linear scan + lambda allocation per
+    // method frame decoded. getValue() preserves the old `entries.first { }` failure behavior.
+    private val kindByValue = Frame.Method.Kind.entries.associateBy { it.value }
+
     @OptIn(InternalSerializationApi::class)
     override val descriptor: SerialDescriptor
         get() = buildSerialDescriptor("Frame.Method", StructureKind.OBJECT)
@@ -36,9 +40,7 @@ object FrameMethodSerializer : KSerializer<Frame.Method> {
     }
 
     override fun deserialize(decoder: Decoder): Frame.Method {
-        val kind = decoder.decodeShort().toUShort().let { byte ->
-            Frame.Method.Kind.entries.first { it.value == byte }
-        }
+        val kind = kindByValue.getValue(decoder.decodeShort().toUShort())
         return when (kind) {
             Frame.Method.Kind.CONNECTION -> decoder.decodeSerializableValue(FrameMethodConnectionSerializer)
             Frame.Method.Kind.CHANNEL -> decoder.decodeSerializableValue(FrameMethodChannelSerializer)
