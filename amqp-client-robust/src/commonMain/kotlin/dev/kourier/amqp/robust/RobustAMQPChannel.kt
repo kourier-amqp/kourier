@@ -69,6 +69,16 @@ open class RobustAMQPChannel(
     private var declaredQos: DeclaredQos? = null
     internal val declaredExchanges = mutableMapOf<String, DeclaredExchange>()
     internal val declaredQueues = mutableMapOf<String, DeclaredQueue>()
+
+    // Queues declared with an empty name are *channel-scoped*: the broker generates the name, ties the queue's
+    // lifetime to this channel, and mints a different name on every declare. They are therefore tracked apart
+    // from `declaredQueues` and re-declared on every restore regardless of `restoreTopology`. That flag is
+    // about the broker topology the user owns, whereas these queues are part of the channel's own state and
+    // simply cease to exist when it closes. Without re-declaring them, the bindings and consumers recorded
+    // against the previous generated name target a queue that is gone, the broker answers `not_found`, and the
+    // freshly reopened channel is closed again. Keyed by the *broker-assigned* name so bindings and consumers,
+    // which only ever saw that name, can be retargeted after the re-declare.
+    internal val serverNamedQueues = mutableMapOf<String, DeclaredQueue>()
     internal val boundExchanges = mutableMapOf<Triple<String, String, String>, BoundExchange>()
     internal val boundQueues = mutableMapOf<Triple<String, String, String>, BoundQueue>()
     internal val consumedQueues = mutableMapOf<Pair<String, String>, ConsumedQueue>()
@@ -116,12 +126,17 @@ open class RobustAMQPChannel(
                 if (txModeRequested) txSelect()
 
                 declaredQos?.let { basicQos(it) }
+
+                // Channel-scoped queues have to come back before anything that references them; this also
+                // retargets their bindings and consumers onto the names the broker has just handed out.
+                restoreServerNamedQueues()
+
                 if (restoreTopology) {
                     declaredExchanges.values.forEach { exchangeDeclare(it) }
                     declaredQueues.values.forEach { queueDeclare(it) }
                     boundExchanges.values.forEach { exchangeBind(it) }
-                    boundQueues.values.forEach { queueBind(it) }
                 }
+                restoreQueueBindings()
 
                 // Snapshot the list and clear the map before iterating:
                 // basicConsume() will re-populate consumedQueues with the broker-assigned consumer tag,
@@ -165,6 +180,53 @@ open class RobustAMQPChannel(
         } catch (e: Exception) {
             restoreCompleted.completeExceptionally(e)
             throw e
+        }
+    }
+
+    /**
+     * Re-declares the channel-scoped server-named queues, retargeting their bindings and consumers onto the
+     * name the broker assigns now, which differs from the one it assigned before the close.
+     */
+    private suspend fun restoreServerNamedQueues() {
+        if (serverNamedQueues.isEmpty()) return
+        // Iterate over a snapshot: queueDeclare() re-populates the live map under the new name. Each queue is
+        // retargeted as soon as its declare succeeds, so the bookkeeping never holds a name the broker no
+        // longer knows, even if a later declare throws and the restore is retried on a fresh connection.
+        serverNamedQueues.toMap().forEach { (previousName, declaredQueue) ->
+            val currentName = queueDeclare(declaredQueue).queueName
+            if (currentName == previousName) return@forEach
+            serverNamedQueues.remove(previousName)
+            retargetQueue(previousName, currentName)
+        }
+    }
+
+    /**
+     * Points every recorded binding and consumer of [previousName] at [currentName], re-keying them so that
+     * later lookups and restores see only the name the broker currently serves.
+     */
+    private fun retargetQueue(previousName: String, currentName: String) {
+        boundQueues.filterValues { it.queue == previousName }.forEach { (previousKey, boundQueue) ->
+            boundQueues.remove(previousKey)
+            boundQueues[Triple(currentName, boundQueue.exchange, boundQueue.routingKey)] =
+                boundQueue.copy(queue = currentName)
+        }
+        consumedQueues.filterKeys { it.first == previousName }.forEach { (previousKey, consumedQueue) ->
+            consumedQueues.remove(previousKey)
+            consumedQueues[Pair(currentName, previousKey.second)] = consumedQueue.copy(queue = currentName)
+        }
+    }
+
+    /**
+     * Replays the recorded queue bindings, which [restoreServerNamedQueues] has already retargeted onto the
+     * current names. When [restoreTopology] is disabled only the server-named bindings are replayed: they
+     * belong to the channel's own lifecycle rather than to the topology the user asked us to leave alone.
+     */
+    private suspend fun restoreQueueBindings() {
+        if (boundQueues.isEmpty()) return
+        // Names are already current here, so queueBind() rewrites each entry under its own key.
+        boundQueues.values.toList().forEach { boundQueue ->
+            if (!restoreTopology && boundQueue.queue !in serverNamedQueues) return@forEach
+            queueBind(boundQueue)
         }
     }
 
@@ -277,13 +339,24 @@ open class RobustAMQPChannel(
         arguments: Table,
     ): AMQPResponse.Channel.Queue.Declared {
         return super.queueDeclare(name, durable, exclusive, autoDelete, arguments).also {
-            if (restoreTopology) declaredQueues[name] = DeclaredQueue(
+            val declaredQueue = DeclaredQueue(
                 name = name,
                 durable = durable,
                 exclusive = exclusive,
                 autoDelete = autoDelete,
                 arguments = arguments
             )
+            // Keep the empty requested name in the spec so the re-declare asks for a new server-generated one,
+            // but key the entry by the assigned name, which is all the bindings and consumers ever saw.
+            // The predicate is deliberately broad: an exclusive queue is scoped to the connection and an
+            // auto-delete one only goes when its last consumer leaves, so re-declaring can leave the previous
+            // queue behind. An orphan queue is a far better outcome than a channel that never recovers.
+            if (name.isEmpty() && (exclusive || autoDelete)) serverNamedQueues[it.queueName] = declaredQueue
+            // Anything else keeps the existing behaviour, including a server-named queue that is durable and
+            // neither exclusive nor auto-delete. Such a queue does outlive its channel, so replaying the empty
+            // name declares a new one on every restore, but recording the assigned name instead is not an
+            // option: the broker reserves the `amq.*` prefix and answers ACCESS_REFUSED to an explicit declare.
+            else if (restoreTopology) declaredQueues[name] = declaredQueue
         }
     }
 
@@ -294,6 +367,7 @@ open class RobustAMQPChannel(
     ): AMQPResponse.Channel.Queue.Deleted {
         return super.queueDelete(name, ifUnused, ifEmpty).also {
             declaredQueues.remove(name)
+            serverNamedQueues.remove(name)
         }
     }
 
@@ -304,12 +378,16 @@ open class RobustAMQPChannel(
         arguments: Table,
     ): AMQPResponse.Channel.Queue.Bound {
         return super.queueBind(queue, exchange, routingKey, arguments).also {
-            if (restoreTopology) boundQueues[Triple(queue, exchange, routingKey)] = BoundQueue(
-                queue = queue,
-                exchange = exchange,
-                routingKey = routingKey,
-                arguments = arguments
-            )
+            // Bindings onto a server-named queue are tracked even without restoreTopology: the queue is
+            // re-declared on every restore, so its bindings have to be replayed or it receives nothing.
+            if (restoreTopology || queue in serverNamedQueues) {
+                boundQueues[Triple(queue, exchange, routingKey)] = BoundQueue(
+                    queue = queue,
+                    exchange = exchange,
+                    routingKey = routingKey,
+                    arguments = arguments
+                )
+            }
         }
     }
 
