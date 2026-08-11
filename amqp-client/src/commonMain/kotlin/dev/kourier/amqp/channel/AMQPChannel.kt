@@ -513,4 +513,154 @@ interface AMQPChannel {
      */
     suspend fun txRollback(): AMQPResponse.Channel.Tx.Rollbacked
 
+    // No-wait variants.
+    //
+    // Each of these sends the same frame as its regular counterpart but with the protocol's `no-wait`
+    // flag set, so the broker sends no reply and the call returns as soon as the frame is written.
+    // Declaring a large topology this way costs one round trip instead of one per declaration.
+    //
+    // The trade-off is that failures no longer surface as a returned error: the broker reports them by
+    // closing the channel, so they arrive asynchronously as an [AMQPException.ChannelClosed] on the
+    // next operation. Use the regular variants when you need to act on the outcome of each call.
+
+    /**
+     * Declares a queue without waiting for the broker to confirm it.
+     *
+     * @param name Name of the queue. Unlike [queueDeclare], it cannot be empty: with no reply there is
+     *             no way to learn the name the broker would have generated.
+     * @param durable If enabled, creates a queue stored on disk; otherwise, transient.
+     * @param exclusive Announces the queue as exclusive to this connection.
+     * @param autoDelete Announces the queue as auto-deleted once its last consumer leaves.
+     * @param arguments Additional arguments (check RabbitMQ documentation).
+     *
+     * @throws IllegalArgumentException if [name] is blank.
+     */
+    suspend fun queueDeclareNoWait(
+        name: String,
+        durable: Boolean = false,
+        exclusive: Boolean = false,
+        autoDelete: Boolean = false,
+        arguments: Table = emptyMap(),
+    )
+
+    /**
+     * Passively declares a queue without waiting for the broker to confirm it.
+     *
+     * Since nothing is returned, this asserts the queue exists rather than reading its state: if it
+     * does not, the broker closes the channel.
+     *
+     * @param name Name of the queue.
+     */
+    suspend fun queueDeclarePassiveNoWait(name: String)
+
+    /**
+     * Deletes a queue without waiting for the broker to confirm it.
+     *
+     * @param name Name of the queue.
+     * @param ifUnused If enabled, queue will only be deleted if it has no consumers.
+     * @param ifEmpty If enabled, queue will only be deleted if it has no messages.
+     */
+    suspend fun queueDeleteNoWait(
+        name: String,
+        ifUnused: Boolean = false,
+        ifEmpty: Boolean = false,
+    )
+
+    /**
+     * Purges a queue without waiting for the broker to confirm it.
+     *
+     * @param name Name of the queue.
+     */
+    suspend fun queuePurgeNoWait(name: String)
+
+    /**
+     * Binds a queue to an exchange without waiting for the broker to confirm it.
+     *
+     * @param queue Name of the queue.
+     * @param exchange Name of the exchange.
+     * @param routingKey Bind only to messages matching routingKey.
+     * @param arguments Bind only to messages matching given options.
+     */
+    suspend fun queueBindNoWait(
+        queue: String,
+        exchange: String,
+        routingKey: String = "",
+        arguments: Table = emptyMap(),
+    )
+
+    /**
+     * Declares an exchange without waiting for the broker to confirm it.
+     *
+     * @param name Name of the exchange.
+     * @param type Type of the exchange.
+     * @param durable If enabled, creates an exchange stored on disk; otherwise, transient.
+     * @param autoDelete If enabled, exchange is deleted when the last binding is removed.
+     * @param internal Whether the exchange cannot be directly published to by a client.
+     * @param arguments Additional arguments (check RabbitMQ documentation).
+     */
+    suspend fun exchangeDeclareNoWait(
+        name: String,
+        type: String,
+        durable: Boolean = false,
+        autoDelete: Boolean = false,
+        internal: Boolean = false,
+        arguments: Table = emptyMap(),
+    )
+
+    /**
+     * Passively declares an exchange without waiting for the broker to confirm it.
+     *
+     * Since nothing is returned, this asserts the exchange exists rather than reading its state: if it
+     * does not, the broker closes the channel.
+     *
+     * @param name Name of the exchange.
+     */
+    suspend fun exchangeDeclarePassiveNoWait(name: String)
+
+    /**
+     * Deletes an exchange without waiting for the broker to confirm it.
+     *
+     * @param name Name of the exchange.
+     * @param ifUnused If enabled, exchange will be deleted only if it has no bindings.
+     */
+    suspend fun exchangeDeleteNoWait(name: String, ifUnused: Boolean = false)
+
+    /**
+     * Binds an exchange to another exchange without waiting for the broker to confirm it.
+     *
+     * @param destination Name of the destination exchange.
+     * @param source Name of the source exchange.
+     * @param routingKey Bind only to messages matching routingKey.
+     * @param arguments Bind only to messages matching given options.
+     */
+    suspend fun exchangeBindNoWait(
+        destination: String,
+        source: String,
+        routingKey: String,
+        arguments: Table = emptyMap(),
+    )
+
+    /**
+     * Unbinds an exchange from another exchange without waiting for the broker to confirm it.
+     *
+     * @param destination Name of the destination exchange.
+     * @param source Name of the source exchange.
+     * @param routingKey Unbind only from messages matching routingKey.
+     * @param arguments Unbind only from messages matching given options.
+     */
+    suspend fun exchangeUnbindNoWait(
+        destination: String,
+        source: String,
+        routingKey: String,
+        arguments: Table = emptyMap(),
+    )
+
+    /**
+     * Puts the channel in publish confirm mode without waiting for the broker to confirm it.
+     *
+     * Frames are processed in order on a channel, so publishes issued after this call are covered by
+     * confirm mode even though the `Confirm.SelectOk` was never awaited.
+     */
+    suspend fun confirmSelectNoWait()
+
 }

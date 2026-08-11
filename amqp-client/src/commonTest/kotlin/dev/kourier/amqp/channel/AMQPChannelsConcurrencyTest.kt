@@ -193,4 +193,50 @@ private class StubChannel(override val id: dev.kourier.amqp.ChannelId) : AMQPCha
     override suspend fun txSelect() = error("not used")
     override suspend fun txCommit() = error("not used")
     override suspend fun txRollback() = error("not used")
+
+    override suspend fun queueDeclareNoWait(
+        name: String,
+        durable: Boolean,
+        exclusive: Boolean,
+        autoDelete: Boolean,
+        arguments: dev.kourier.amqp.Table,
+    ) = error("not used")
+
+    override suspend fun queueDeclarePassiveNoWait(name: String) = error("not used")
+    override suspend fun queueDeleteNoWait(name: String, ifUnused: Boolean, ifEmpty: Boolean) = error("not used")
+    override suspend fun queuePurgeNoWait(name: String) = error("not used")
+    override suspend fun queueBindNoWait(
+        queue: String,
+        exchange: String,
+        routingKey: String,
+        arguments: dev.kourier.amqp.Table,
+    ) = error("not used")
+
+    override suspend fun exchangeDeclareNoWait(
+        name: String,
+        type: String,
+        durable: Boolean,
+        autoDelete: Boolean,
+        internal: Boolean,
+        arguments: dev.kourier.amqp.Table,
+    ) = error("not used")
+
+    override suspend fun exchangeDeclarePassiveNoWait(name: String) = error("not used")
+    override suspend fun exchangeDeleteNoWait(name: String, ifUnused: Boolean) = error("not used")
+    override suspend fun exchangeBindNoWait(
+        destination: String,
+        source: String,
+        routingKey: String,
+        arguments: dev.kourier.amqp.Table,
+    ) = error("not used")
+
+    override suspend fun exchangeUnbindNoWait(
+        destination: String,
+        source: String,
+        routingKey: String,
+        arguments: dev.kourier.amqp.Table,
+    ) = error("not used")
+
+    override suspend fun confirmSelectNoWait() = error("not used")
+
 }

@@ -824,4 +824,218 @@ open class DefaultAMQPChannel(
         return writeAndWaitForResponse(rollback)
     }
 
+    // No-wait variants: same frame with `noWait = true`, written without awaiting a reply.
+
+    override suspend fun queueDeclareNoWait(
+        name: String,
+        durable: Boolean,
+        exclusive: Boolean,
+        autoDelete: Boolean,
+        arguments: Table,
+    ) {
+        require(name.isNotBlank()) {
+            "queueDeclareNoWait requires a queue name: with no reply, a server-generated one could never be read back"
+        }
+        write(
+            Frame(
+                channelId = id,
+                payload = Frame.Method.Queue.Declare(
+                    reserved1 = 0u,
+                    queueName = name,
+                    passive = false,
+                    durable = durable,
+                    exclusive = exclusive,
+                    autoDelete = autoDelete,
+                    noWait = true,
+                    arguments = arguments
+                )
+            )
+        )
+    }
+
+    override suspend fun queueDeclarePassiveNoWait(name: String) {
+        write(
+            Frame(
+                channelId = id,
+                payload = Frame.Method.Queue.Declare(
+                    reserved1 = 0u,
+                    queueName = name,
+                    passive = true,
+                    durable = false,
+                    exclusive = true,
+                    autoDelete = true,
+                    noWait = true,
+                    arguments = emptyMap()
+                )
+            )
+        )
+    }
+
+    override suspend fun queueDeleteNoWait(
+        name: String,
+        ifUnused: Boolean,
+        ifEmpty: Boolean,
+    ) {
+        write(
+            Frame(
+                channelId = id,
+                payload = Frame.Method.Queue.Delete(
+                    reserved1 = 0u,
+                    queueName = name,
+                    ifUnused = ifUnused,
+                    ifEmpty = ifEmpty,
+                    noWait = true
+                )
+            )
+        )
+    }
+
+    override suspend fun queuePurgeNoWait(name: String) {
+        write(
+            Frame(
+                channelId = id,
+                payload = Frame.Method.Queue.Purge(
+                    reserved1 = 0u,
+                    queueName = name,
+                    noWait = true
+                )
+            )
+        )
+    }
+
+    override suspend fun queueBindNoWait(
+        queue: String,
+        exchange: String,
+        routingKey: String,
+        arguments: Table,
+    ) {
+        write(
+            Frame(
+                channelId = id,
+                payload = Frame.Method.Queue.Bind(
+                    reserved1 = 0u,
+                    queueName = queue,
+                    exchangeName = exchange,
+                    routingKey = routingKey,
+                    noWait = true,
+                    arguments = arguments
+                )
+            )
+        )
+    }
+
+    override suspend fun exchangeDeclareNoWait(
+        name: String,
+        type: String,
+        durable: Boolean,
+        autoDelete: Boolean,
+        internal: Boolean,
+        arguments: Table,
+    ) {
+        write(
+            Frame(
+                channelId = id,
+                payload = Frame.Method.Exchange.Declare(
+                    reserved1 = 0u,
+                    exchangeName = name,
+                    exchangeType = type,
+                    passive = false,
+                    durable = durable,
+                    autoDelete = autoDelete,
+                    internal = internal,
+                    noWait = true,
+                    arguments = arguments
+                )
+            )
+        )
+    }
+
+    override suspend fun exchangeDeclarePassiveNoWait(name: String) {
+        write(
+            Frame(
+                channelId = id,
+                payload = Frame.Method.Exchange.Declare(
+                    reserved1 = 0u,
+                    exchangeName = name,
+                    exchangeType = "",
+                    passive = true,
+                    durable = false,
+                    autoDelete = false,
+                    internal = false,
+                    noWait = true,
+                    arguments = emptyMap()
+                )
+            )
+        )
+    }
+
+    override suspend fun exchangeDeleteNoWait(name: String, ifUnused: Boolean) {
+        write(
+            Frame(
+                channelId = id,
+                payload = Frame.Method.Exchange.Delete(
+                    reserved1 = 0u,
+                    exchangeName = name,
+                    ifUnused = ifUnused,
+                    noWait = true
+                )
+            )
+        )
+    }
+
+    override suspend fun exchangeBindNoWait(
+        destination: String,
+        source: String,
+        routingKey: String,
+        arguments: Table,
+    ) {
+        write(
+            Frame(
+                channelId = id,
+                payload = Frame.Method.Exchange.Bind(
+                    reserved1 = 0u,
+                    destination = destination,
+                    source = source,
+                    routingKey = routingKey,
+                    noWait = true,
+                    arguments = arguments
+                )
+            )
+        )
+    }
+
+    override suspend fun exchangeUnbindNoWait(
+        destination: String,
+        source: String,
+        routingKey: String,
+        arguments: Table,
+    ) {
+        write(
+            Frame(
+                channelId = id,
+                payload = Frame.Method.Exchange.Unbind(
+                    reserved1 = 0u,
+                    destination = destination,
+                    source = source,
+                    routingKey = routingKey,
+                    noWait = true,
+                    arguments = arguments
+                )
+            )
+        )
+    }
+
+    override suspend fun confirmSelectNoWait() {
+        if (isConfirmMode) return
+        write(
+            Frame(
+                channelId = id,
+                payload = Frame.Method.Confirm.Select(
+                    noWait = true
+                )
+            )
+        )
+        isConfirmMode = true
+    }
+
 }
