@@ -134,12 +134,13 @@ open class DefaultAMQPConnection(
         val tcpClient = aSocket(selector).tcp()
 
         val connection = config.connection
+        val ctx = currentCoroutineContext()
         socket = when (connection) {
-            is AMQPConfig.Connection.Tls -> tcpClient
-                .connect(config.server.host, config.server.port)
-                .apply {
-                    connection.tlsConfiguration?.let { tls(coroutineContext, it) } ?: tls(coroutineContext)
-                }
+            is AMQPConfig.Connection.Tls -> {
+                val rawSocket = tcpClient.connect(config.server.host, config.server.port)
+                connection.tlsConfiguration?.let { rawSocket.tls(ctx, it) }
+                    ?: rawSocket.tls(ctx)
+            }
 
             is AMQPConfig.Connection.Plain -> tcpClient
                 .connect(config.server.host, config.server.port)
