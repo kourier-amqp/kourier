@@ -525,4 +525,107 @@ open class RobustAMQPChannel(
         return super.txSelect().also { txModeRequested = true }
     }
 
+    // No-wait variants record exactly what their awaiting counterparts record. Without this, topology
+    // declared through them would be missing from a restore and silently disappear on the first
+    // reconnect. Restore itself keeps using the awaiting variants, since it has no one to report to.
+
+    override suspend fun exchangeDeclareNoWait(
+        name: String,
+        type: String,
+        durable: Boolean,
+        autoDelete: Boolean,
+        internal: Boolean,
+        arguments: Table,
+    ) {
+        super.exchangeDeclareNoWait(name, type, durable, autoDelete, internal, arguments)
+        if (!internal && restoreTopology) declaredExchanges[name] = DeclaredExchange(
+            name = name,
+            type = type,
+            durable = durable,
+            autoDelete = autoDelete,
+            internal = internal,
+            arguments = arguments
+        )
+    }
+
+    override suspend fun exchangeDeleteNoWait(name: String, ifUnused: Boolean) {
+        super.exchangeDeleteNoWait(name, ifUnused)
+        declaredExchanges.remove(name)
+    }
+
+    override suspend fun exchangeBindNoWait(
+        destination: String,
+        source: String,
+        routingKey: String,
+        arguments: Table,
+    ) {
+        super.exchangeBindNoWait(destination, source, routingKey, arguments)
+        if (restoreTopology) boundExchanges[Triple(destination, source, routingKey)] = BoundExchange(
+            destination = destination,
+            source = source,
+            routingKey = routingKey,
+            arguments = arguments
+        )
+    }
+
+    override suspend fun exchangeUnbindNoWait(
+        destination: String,
+        source: String,
+        routingKey: String,
+        arguments: Table,
+    ) {
+        super.exchangeUnbindNoWait(destination, source, routingKey, arguments)
+        boundExchanges.remove(Triple(destination, source, routingKey))
+    }
+
+    override suspend fun queueDeclareNoWait(
+        name: String,
+        durable: Boolean,
+        exclusive: Boolean,
+        autoDelete: Boolean,
+        arguments: Table,
+    ) {
+        super.queueDeclareNoWait(name, durable, exclusive, autoDelete, arguments)
+        // A no-wait declare always carries a name, so it can never be one of the server-named queues.
+        if (restoreTopology) declaredQueues[name] = DeclaredQueue(
+            name = name,
+            durable = durable,
+            exclusive = exclusive,
+            autoDelete = autoDelete,
+            arguments = arguments
+        )
+    }
+
+    override suspend fun queueDeleteNoWait(
+        name: String,
+        ifUnused: Boolean,
+        ifEmpty: Boolean,
+    ) {
+        super.queueDeleteNoWait(name, ifUnused, ifEmpty)
+        declaredQueues.remove(name)
+        serverNamedQueues.remove(name)
+    }
+
+    override suspend fun queueBindNoWait(
+        queue: String,
+        exchange: String,
+        routingKey: String,
+        arguments: Table,
+    ) {
+        super.queueBindNoWait(queue, exchange, routingKey, arguments)
+        if (restoreTopology || queue in serverNamedQueues) {
+            boundQueues[Triple(queue, exchange, routingKey)] = BoundQueue(
+                queue = queue,
+                exchange = exchange,
+                routingKey = routingKey,
+                arguments = arguments
+            )
+        }
+    }
+
+    override suspend fun confirmSelectNoWait() {
+        super.confirmSelectNoWait()
+        confirmModeRequested = true
+    }
+
 }
