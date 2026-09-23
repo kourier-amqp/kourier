@@ -259,7 +259,7 @@ open class DefaultAMQPConnection(
                     "connection_name" to Field.LongString(config.server.connectionName),
                     "product" to Field.LongString("kourier-amqp-client"),
                     "platform" to Field.LongString("Kotlin"),
-                    "version" to Field.LongString("0.4.7"),
+                    "version" to Field.LongString("0.5.0"),
                     "capabilities" to Field.Table(
                         mapOf(
                             "publisher_confirms" to Field.Boolean(true),
