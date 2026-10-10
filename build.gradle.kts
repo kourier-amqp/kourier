@@ -27,4 +27,9 @@ dependencies {
     kover(projects.amqpClient)
     kover(projects.amqpClientRobust)
     kover(projects.amqpClientOpentelemetry)
+
+    dokka(projects.amqpCore)
+    dokka(projects.amqpClient)
+    dokka(projects.amqpClientRobust)
+    dokka(projects.amqpClientOpentelemetry)
 }
