@@ -13,6 +13,8 @@ plugins {
 }
 
 mavenPublishing {
+    // Empty javadoc jars: the full Dokka site is published on kourier.dev, and embedding it
+    // in every platform publication would blow the Maven Central size limits.
     configure(KotlinMultiplatform(javadocJar = JavadocJar.Empty(), sourcesJar = SourcesJar.Sources()))
     publishToMavenCentral()
     signAllPublications()
