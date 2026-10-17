@@ -138,22 +138,7 @@ open class RobustAMQPChannel(
                 }
                 restoreQueueBindings()
 
-                // Snapshot the list and clear the map before iterating:
-                // basicConsume() will re-populate consumedQueues with the broker-assigned consumer tag,
-                // which would cause a ConcurrentModificationException if we iterated the live map.
-                val queuesToRestore = consumedQueues.values.toList()
-                consumedQueues.clear()
-                queuesToRestore.forEach { consumedQueue ->
-                    basicConsume(
-                        queue = consumedQueue.queue,
-                        consumerTag = consumedQueue.consumerTag,
-                        noAck = consumedQueue.noAck,
-                        exclusive = consumedQueue.exclusive,
-                        arguments = consumedQueue.arguments,
-                        onDelivery = consumedQueue.onDelivery,
-                        onCanceled = consumedQueue.onCanceled
-                    )
-                }
+                restoreConsumers()
             }
             restoreCompleted.complete(Unit)
         } catch (e: TimeoutCancellationException) {
@@ -227,6 +212,27 @@ open class RobustAMQPChannel(
         boundQueues.values.toList().forEach { boundQueue ->
             if (!restoreTopology && boundQueue.queue !in serverNamedQueues) return@forEach
             queueBind(boundQueue)
+        }
+    }
+
+    /**
+     * Re-registers the recorded consumers. An entry is only replaced once its consumer is back, so a restore
+     * that fails or times out midway leaves the remaining consumers in place for the next attempt.
+     */
+    private suspend fun restoreConsumers() {
+        // Iterate over a snapshot: basicConsume() records the restored consumer under the tag the broker hands
+        // back, which differs from the previous one for broker-assigned tags.
+        consumedQueues.toMap().forEach { (previousKey, consumedQueue) ->
+            val consumeOk = basicConsume(
+                queue = consumedQueue.queue,
+                consumerTag = consumedQueue.consumerTag,
+                noAck = consumedQueue.noAck,
+                exclusive = consumedQueue.exclusive,
+                arguments = consumedQueue.arguments,
+                onDelivery = consumedQueue.onDelivery,
+                onCanceled = consumedQueue.onCanceled
+            )
+            if (Pair(consumedQueue.queue, consumeOk.consumerTag) != previousKey) consumedQueues.remove(previousKey)
         }
     }
 
