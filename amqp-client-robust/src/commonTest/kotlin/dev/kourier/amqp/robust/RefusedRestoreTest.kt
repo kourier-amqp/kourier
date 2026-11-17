@@ -138,4 +138,110 @@ class RefusedRestoreTest {
             scope.cancel()
         }
     }
+
+    /**
+     * A retry the broker refuses as well is retried again, with the backoff, until the queue is back.
+     */
+    @Test
+    fun refusedRestoreIsRetriedUntilTheQueueIsBack(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 200.milliseconds
+                reconnectMaxDelay = 400.milliseconds
+            }
+        }
+        val connection = RefusedRestoreConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-refused-restore-retried-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as RefusedRestoreChannel
+            val receiver = channel.basicConsume(queue = queue, noAck = true, arguments = emptyMap())
+            channel.beforeRestoreConsume = { adminChannel.queueDelete(queue) }
+
+            connection.write(Frame(channelId = 1u, payload = Frame.Heartbeat))
+            withTimeout(10.seconds) { channel.restoreConsumeRefused.await() }
+
+            // The queue stays unavailable across several retries, each refused in turn.
+            withTimeout(10.seconds) { while (channel.restoreConsumeAttempts < 3) delay(50) }
+
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            withTimeoutOrNull(10.seconds) {
+                while (adminChannel.consumerCount(queue) == 0u) delay(100)
+            }
+            adminChannel.basicPublish("After retries".toByteArray(), exchange = "", routingKey = queue)
+            val delivery = withTimeoutOrNull(5.seconds) { receiver.receive() }
+            assertNotNull(delivery, "Consumer was not restored once the queue was back")
+            assertEquals("After retries", delivery.message.body.decodeToString())
+        } finally {
+            runCatching {
+                withTimeout(5.seconds) {
+                    admin.openChannel().queueDelete(queue)
+                    admin.close()
+                    connection.close()
+                }
+            }
+            scope.cancel()
+        }
+    }
+
+    /**
+     * A reconnect while a refused restore waits for its retry restores the channel at once, and the pending retry
+     * does not run on the new connection.
+     */
+    @Test
+    fun reconnectWhileRetryingRestoresTheChannel(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 30.seconds
+                reconnectMaxDelay = 30.seconds
+            }
+        }
+        val connection = RefusedRestoreConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-refused-restore-reconnect-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as RefusedRestoreChannel
+            val receiver = channel.basicConsume(queue = queue, noAck = true, arguments = emptyMap())
+            channel.beforeRestoreConsume = { adminChannel.queueDelete(queue) }
+
+            connection.write(Frame(channelId = 1u, payload = Frame.Heartbeat))
+            withTimeout(10.seconds) { channel.restoreConsumeRefused.await() }
+            delay(300.milliseconds)
+            assertEquals(ConnectionState.CLOSED, channel.state)
+            val attempts = channel.restoreConsumeAttempts
+
+            // The queue is back, and the connection drops again long before the retry is due.
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            connection.write(Frame(channelId = 1u, payload = Frame.Heartbeat))
+
+            withTimeoutOrNull(10.seconds) {
+                while (adminChannel.consumerCount(queue) == 0u) delay(100)
+            }
+            adminChannel.basicPublish("After reconnect".toByteArray(), exchange = "", routingKey = queue)
+            val delivery = withTimeoutOrNull(5.seconds) { receiver.receive() }
+            assertNotNull(delivery, "Consumer was not restored by the reconnect")
+            assertEquals("After reconnect", delivery.message.body.decodeToString())
+            assertEquals(attempts + 1, channel.restoreConsumeAttempts, "Restore ran more than once on the reconnect")
+            assertEquals(1u, adminChannel.consumerCount(queue))
+        } finally {
+            runCatching {
+                withTimeout(5.seconds) {
+                    admin.openChannel().queueDelete(queue)
+                    admin.close()
+                    connection.close()
+                }
+            }
+            scope.cancel()
+        }
+    }
 }
