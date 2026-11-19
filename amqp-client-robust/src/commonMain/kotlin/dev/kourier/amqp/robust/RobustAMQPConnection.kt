@@ -52,6 +52,13 @@ open class RobustAMQPConnection(
     @Volatile
     private var iterationClosed: CompletableDeferred<Unit> = CompletableDeferred()
 
+    /**
+     * The close signal of the current [connectionFactory] iteration, which identifies the connection a channel was
+     * restored on: a channel retrying a refused restore stops once this changes or completes.
+     */
+    internal val currentIteration: CompletableDeferred<Unit>
+        get() = iterationClosed
+
     override suspend fun connect() {
         reconnectSubscription?.cancel()
         reconnectSubscription = messageListeningScope.launch {
@@ -112,7 +119,7 @@ open class RobustAMQPConnection(
                                 throw e
                             } catch (e: Exception) {
                                 logger.error(
-                                    "Failed to restore channel ${channel.id}, it will be retried on next reconnect",
+                                    "Failed to restore channel ${channel.id}, it will be retried",
                                     e,
                                 )
                             }

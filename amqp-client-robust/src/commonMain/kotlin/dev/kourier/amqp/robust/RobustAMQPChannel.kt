@@ -6,7 +6,11 @@ import dev.kourier.amqp.connection.ConnectionState
 import dev.kourier.amqp.states.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
@@ -31,8 +35,14 @@ open class RobustAMQPChannel(
     // AGAIN. The broker then closes the *connection* with CHANNEL_ERROR 504
     // "second 'channel.open' seen". `tryLock` lets only one restore run per close event;
     // any concurrent caller skips silently — the channel state ends up correctly restored
-    // by the winning path.
+    // by the winning path. Every restore runs under this latch (the reconnect one, the
+    // broker-close one and the retry of a refused one), so they never overlap.
     private val restoreLatch = Mutex()
+
+    // Retries a restore the broker refused (see [restoreRefused]), with the reconnect backoff,
+    // as long as the connection it was refused on is up. Cancelled by the next reconnect,
+    // which restores the channel itself.
+    private var restoreRetry: Job? = null
 
     // One-shot restore token. Armed exactly once per broker Channel.Close in onBrokerClose() —
     // which the read loop calls BEFORE the close is observable to either restore trigger — and
@@ -110,7 +120,17 @@ open class RobustAMQPChannel(
     }
 
     @InternalAmqpApi
-    suspend fun restore() = withChannelRestoreContext {
+    suspend fun restore() {
+        // The reconnect restores the channel itself: a retry of a restore refused on the previous connection
+        // is moot, and must not run on the new one alongside this restore.
+        restoreRetry?.cancelAndJoin()
+        restoreLatch.withLock { restoreLocked() }
+    }
+
+    /**
+     * Restores the channel. The caller holds [restoreLatch].
+     */
+    private suspend fun restoreLocked() = withChannelRestoreContext {
         prepareForRestore()
 
         try {
@@ -162,9 +182,61 @@ open class RobustAMQPChannel(
             // (rather than relying on the generic catch below) so this intent survives edits.
             restoreCompleted.completeExceptionally(e)
             throw e
+        } catch (e: AMQPException.ChannelClosed) {
+            // A close of the whole connection also fails the restore with ChannelClosed: the reconnect handles it.
+            if (connection.state == ConnectionState.OPEN) restoreRefused(e)
+            else restoreCompleted.completeExceptionally(e)
+            throw e
         } catch (e: Exception) {
             restoreCompleted.completeExceptionally(e)
             throw e
+        }
+    }
+
+    /**
+     * The broker refused part of the restore and closed the channel, e.g. a `basic.consume` answered 404 NOT_FOUND
+     * because the node that hosts the queue is down while the client has reconnected to another node.
+     *
+     * `open()` has already marked the channel `OPEN`: mark it closed again, since the broker has closed it, fail the
+     * writers waiting for the restore, and try the restore again later on the same connection. Retrying at once, on
+     * every close, would only hammer the broker while the queue is unavailable.
+     */
+    private fun restoreRefused(e: AMQPException.ChannelClosed) {
+        state = ConnectionState.CLOSED
+        // The close that refused the restore is handled here: it must not trigger another restore of its own.
+        pendingRestore = false
+        restoreCompleted.completeExceptionally(e)
+        logger.warn("Restore of channel $id refused by the broker: ${e.replyText} (${e.replyCode}), it will be retried")
+        scheduleRestoreRetry()
+    }
+
+    private fun scheduleRestoreRetry() {
+        if (restoreRetry?.isActive == true) return // Already retrying: the running retry loops on.
+        val iteration = connection.currentIteration
+        val server = connection.config.server
+        restoreRetry = connection.messageListeningScope.launch {
+            var retryDelay = server.reconnectInitialDelay
+            while (true) {
+                delay(retryDelay)
+                retryDelay = (retryDelay * server.reconnectBackoffMultiplier).coerceAtMost(server.reconnectMaxDelay)
+                // The connection the restore was refused on is gone: the reconnect restores the channel.
+                if (connection.currentIteration !== iteration || iteration.isCompleted) return@launch
+                if (connection.state != ConnectionState.OPEN) return@launch
+                if (!restoreLatch.tryLock()) continue // Another restore is running, check again later.
+                try {
+                    // Restored meanwhile, or closed by the application.
+                    if (state != ConnectionState.CLOSED || channelClosed.isCompleted) return@launch
+                    logger.debug("Retrying the restore of channel $id")
+                    restoreLocked()
+                    return@launch
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logger.debug("Retry of the restore of channel $id failed: ${e.message}")
+                } finally {
+                    restoreLatch.unlock()
+                }
+            }
         }
     }
 
@@ -269,7 +341,7 @@ open class RobustAMQPChannel(
             if (!pendingRestore) return
             pendingRestore = false
             logger.debug("Channel $id closed, attempting to restore...")
-            restore()
+            restoreLocked()
         } finally {
             restoreLatch.unlock()
         }
