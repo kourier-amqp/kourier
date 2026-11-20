@@ -543,4 +543,68 @@ class RefusedRestoreTest {
             scope.cancel()
         }
     }
+
+    /**
+     * After a `basic.cancel` from the broker, the robust channel consumes the queue again. While the queue is still
+     * unavailable, the broker refuses that consume with 404 NOT_FOUND and closes the channel; the restore that
+     * follows is refused in turn. The channel must then take the path of a refused restore: reported closed, retried
+     * with the backoff rather than on every close, and restored once the queue is back.
+     */
+    @Test
+    fun consumeAgainAfterABrokerCancelRefusedIsRetriedLikeARefusedRestore(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 1.seconds
+                reconnectMaxDelay = 1.seconds
+            }
+        }
+        val connection = RefusedRestoreConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-refused-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as RefusedRestoreChannel
+            val receiver = channel.basicConsume(queue = queue, noAck = true, arguments = emptyMap())
+
+            // The queue goes away: the broker sends basic.cancel, and the queue is still missing when the channel
+            // consumes it again, then when the restore that follows the refusal does.
+            adminChannel.queueDelete(queue)
+            withTimeout(10.seconds) { channel.restoreConsumeRefused.await() }
+
+            delay(300.milliseconds)
+            assertEquals(ConnectionState.CLOSED, channel.state, "Channel left OPEN after the broker refused its restore")
+            assertTrue(
+                channel.restoreConsumeAttempts <= 2,
+                "Restore retried ${channel.restoreConsumeAttempts} times within 300 ms, before the retry delay"
+            )
+            assertIs<AMQPException.ChannelClosed>(channel.restoreConsumeFailures.first().first)
+            assertEquals(1, connection.openConnectionCount, "The refusal was handled by a reconnect")
+
+            // The queue is back: the retry restores the channel on the same connection, and the consumer gets it.
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            withTimeoutOrNull(10.seconds) {
+                while (adminChannel.consumerCount(queue) == 0u) delay(100)
+            }
+            assertEquals(1u, adminChannel.consumerCount(queue), "The queue was not consumed again once it was back")
+            adminChannel.basicPublish("After refused consume".toByteArray(), exchange = "", routingKey = queue)
+            val delivery = withTimeoutOrNull(5.seconds) { receiver.receive() }
+            assertNotNull(delivery, "The consumer did not receive the message published once the queue was back")
+            assertEquals("After refused consume", delivery.message.body.decodeToString())
+            assertEquals(ConnectionState.OPEN, channel.state)
+            assertEquals(1, connection.openConnectionCount, "The channel was restored by a reconnect")
+        } finally {
+            runCatching {
+                withTimeout(5.seconds) {
+                    admin.openChannel().queueDelete(queue)
+                    admin.close()
+                    connection.close()
+                }
+            }
+            scope.cancel()
+        }
+    }
 }

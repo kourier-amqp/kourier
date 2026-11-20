@@ -93,6 +93,15 @@ open class RobustAMQPChannel(
     internal val boundQueues = mutableMapOf<Triple<String, String, String>, BoundQueue>()
     internal val consumedQueues = mutableMapOf<Pair<String, String>, ConsumedQueue>()
 
+    // Consumer tags the application is cancelling through [basicCancel]: their `Basic.Canceled` is the answer to
+    // that cancel, forwarded to the application, whereas any other one is a `basic.cancel` sent by the broker.
+    private val cancelingConsumerTags = mutableSetOf<String>()
+
+    // Queues the application is deleting through [queueDelete], with the number of deletes in flight: the broker
+    // cancels their consumers, and that `basic.cancel` is forwarded to the application rather than recovered from.
+    private val deletingQueues = mutableMapOf<String, Int>()
+    private val cancelingMutex = Mutex()
+
     private val restoreTopology: Boolean
         get() = connection.config.server.restoreTopology
 
@@ -443,10 +452,27 @@ open class RobustAMQPChannel(
         ifUnused: Boolean,
         ifEmpty: Boolean,
     ): AMQPResponse.Channel.Queue.Deleted {
-        return super.queueDelete(name, ifUnused, ifEmpty).also {
-            declaredQueues.remove(name)
-            serverNamedQueues.remove(name)
+        // The broker cancels the consumers of a queue it deletes: that cancel, asked for by the application, must not
+        // be mistaken for one to recover from. The consumers stay registered until the delete succeeds: a refused
+        // delete closes the channel, and the restore that follows, which may run before this call fails, must
+        // consume the queue again.
+        cancelingMutex.withLock { deletingQueues[name] = (deletingQueues[name] ?: 0) + 1 }
+        val deleted = try {
+            super.queueDelete(name, ifUnused, ifEmpty)
+        } finally {
+            cancelingMutex.withLock {
+                val count = deletingQueues.getValue(name) - 1
+                if (count == 0) deletingQueues.remove(name) else deletingQueues[name] = count
+            }
         }
+        removeConsumers(name)
+        declaredQueues.remove(name)
+        serverNamedQueues.remove(name)
+        return deleted
+    }
+
+    private fun removeConsumers(queue: String) {
+        consumedQueues.keys.removeAll { it.first == queue }
     }
 
     override suspend fun queueBind(
@@ -535,6 +561,11 @@ open class RobustAMQPChannel(
                             || connection.connectionClosed.isCompleted
                     if (!terminal) return@basicConsume
                 }
+                // A consumer the broker cancelled (its queue became unavailable, e.g. the node that hosts it went
+                // down) is consumed again, like after a restore: the consumer must not see a cancellation either.
+                if (response is AMQPResponse.Channel.Basic.Canceled && consumeAgainAfterBrokerCancel(queue, response)) {
+                    return@basicConsume
+                }
                 onCanceled(response)
             }
         ).also {
@@ -550,10 +581,62 @@ open class RobustAMQPChannel(
         }
     }
 
+    /**
+     * Schedules a new `basic.consume` for the consumer the broker cancelled with [canceled], if it is still
+     * registered and the application did not cancel it itself. Returns whether it did.
+     *
+     * The queue is unavailable right now, so the consume waits for the reconnect delay first. If the broker refuses
+     * it, it closes the channel, and the channel's restore consumes the queue again, since the consumer stays
+     * registered. A restore that happens meanwhile consumes it again too, which this one then leaves alone.
+     */
+    private suspend fun consumeAgainAfterBrokerCancel(
+        queue: String,
+        canceled: AMQPResponse.Channel.Basic.Canceled,
+    ): Boolean {
+        val askedForByTheApplication = cancelingMutex.withLock {
+            canceled.consumerTag in cancelingConsumerTags || queue in deletingQueues
+        }
+        if (askedForByTheApplication) return false
+        val key = Pair(queue, canceled.consumerTag)
+        val consumedQueue = consumedQueues[key] ?: return false
+        logger.warn("Consumer ${canceled.consumerTag} of queue $queue on channel $id cancelled by the broker, consuming it again")
+        connection.messageListeningScope.launch {
+            delay(connection.config.server.reconnectInitialDelay)
+            // Cancelled by the application, or already consumed again by a restore, meanwhile.
+            if (consumedQueues[key] !== consumedQueue) return@launch
+            if (state != ConnectionState.OPEN || connection.state != ConnectionState.OPEN) return@launch
+            try {
+                val consumeOk = basicConsume(
+                    queue = consumedQueue.queue,
+                    consumerTag = consumedQueue.consumerTag,
+                    noAck = consumedQueue.noAck,
+                    exclusive = consumedQueue.exclusive,
+                    arguments = consumedQueue.arguments,
+                    onDelivery = consumedQueue.onDelivery,
+                    onCanceled = consumedQueue.onCanceled
+                )
+                if (Pair(queue, consumeOk.consumerTag) != key) consumedQueues.remove(key)
+                logger.info("Queue $queue consumed again on channel $id after the broker cancelled its consumer")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // The consumer stays registered: the restore that follows a refusal consumes the queue again.
+                logger.warn("Failed to consume queue $queue again on channel $id: ${e.message}")
+            }
+        }
+        return true
+    }
+
     override suspend fun basicCancel(consumerTag: String): AMQPResponse.Channel.Basic.Canceled {
-        return super.basicCancel(consumerTag).also {
-            val key = consumedQueues.entries.find { it.value.consumerTag == consumerTag }?.key ?: return@also
-            consumedQueues.remove(key)
+        cancelingMutex.withLock { cancelingConsumerTags.add(consumerTag) }
+        try {
+            return super.basicCancel(consumerTag).also {
+                // Entries are keyed by the broker-assigned tag, which is what the application cancels with.
+                val key = consumedQueues.keys.find { it.second == consumerTag } ?: return@also
+                consumedQueues.remove(key)
+            }
+        } finally {
+            cancelingMutex.withLock { cancelingConsumerTags.remove(consumerTag) }
         }
     }
 
@@ -679,6 +762,9 @@ open class RobustAMQPChannel(
         ifUnused: Boolean,
         ifEmpty: Boolean,
     ) {
+        // See queueDelete. With no reply, the consumers are dropped before the delete: its basic.cancel is forwarded,
+        // and a refused delete cannot keep them.
+        removeConsumers(name)
         super.queueDeleteNoWait(name, ifUnused, ifEmpty)
         declaredQueues.remove(name)
         serverNamedQueues.remove(name)
