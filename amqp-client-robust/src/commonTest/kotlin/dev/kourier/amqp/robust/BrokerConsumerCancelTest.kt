@@ -1,5 +1,6 @@
 package dev.kourier.amqp.robust
 
+import dev.kourier.amqp.AMQPException
 import dev.kourier.amqp.AMQPResponse
 import dev.kourier.amqp.ChannelId
 import dev.kourier.amqp.Frame
@@ -15,6 +16,7 @@ import kotlinx.coroutines.*
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -35,6 +37,21 @@ private class ConsumeCountingChannel(
     var consumeCalls = 0
     var restoreConsumeCalls = 0
 
+    /**
+     * Runs, once, in place of the next `basic.consume` made outside a restore (the consume made again after a
+     * `basic.cancel` from the broker, once the application has consumed its queues), given that consume to run:
+     * makes something happen at that exact moment (the application closes the channel, the connection drops).
+     */
+    var aroundNextConsume: (suspend (consume: suspend () -> AMQPResponse.Channel.Basic.ConsumeOk) -> AMQPResponse.Channel.Basic.ConsumeOk)? =
+        null
+
+    /**
+     * Holds the next close of the channel by the application in its `SHUTTING_DOWN` state, as a close whose reply
+     * has not arrived yet, until this completes. [closing] completes once the close is held.
+     */
+    var holdNextClose: CompletableDeferred<Unit>? = null
+    val closing = CompletableDeferred<Unit>()
+
     override suspend fun basicConsume(
         queue: String,
         consumerTag: String,
@@ -44,8 +61,25 @@ private class ConsumeCountingChannel(
         onDelivery: suspend (AMQPResponse.Channel.Message.Delivery) -> Unit,
         onCanceled: suspend (AMQPResponse.Channel) -> Unit,
     ): AMQPResponse.Channel.Basic.ConsumeOk {
-        if (currentChannelRestoreContext() == null) consumeCalls++ else restoreConsumeCalls++
-        return super.basicConsume(queue, consumerTag, noAck, exclusive, arguments, onDelivery, onCanceled)
+        if (currentChannelRestoreContext() != null) {
+            restoreConsumeCalls++
+            return super.basicConsume(queue, consumerTag, noAck, exclusive, arguments, onDelivery, onCanceled)
+        }
+        consumeCalls++
+        val around = aroundNextConsume
+            ?: return super.basicConsume(queue, consumerTag, noAck, exclusive, arguments, onDelivery, onCanceled)
+        aroundNextConsume = null
+        return around { super.basicConsume(queue, consumerTag, noAck, exclusive, arguments, onDelivery, onCanceled) }
+    }
+
+    override suspend fun close(reason: String, code: UShort): AMQPResponse.Channel.Closed {
+        holdNextClose?.let { hold ->
+            holdNextClose = null
+            state = ConnectionState.SHUTTING_DOWN
+            closing.complete(Unit)
+            hold.await()
+        }
+        return super.close(reason, code)
     }
 }
 
@@ -55,6 +89,21 @@ private class ConsumeCountingConnection(
 ) : RobustAMQPConnection(config, scope) {
 
     public override suspend fun connect() = super.connect()
+
+    var openConnectionCount = 0
+
+    /** Holds the next reconnect, before it opens the connection, until this completes (the broker is unreachable). */
+    var holdNextReconnect: CompletableDeferred<Unit>? = null
+    val reconnecting = CompletableDeferred<Unit>()
+
+    override suspend fun openConnection() {
+        if (openConnectionCount++ > 0) holdNextReconnect?.let { hold ->
+            holdNextReconnect = null
+            reconnecting.complete(Unit)
+            hold.await()
+        }
+        super.openConnection()
+    }
 
     override fun createChannel(id: ChannelId, frameMax: UInt): AMQPChannel =
         ConsumeCountingChannel(this, id, frameMax)
@@ -571,6 +620,871 @@ class BrokerConsumerCancelTest {
             assertEquals(0u, adminChannel.consumerCount(queue), "A consumer cancelled by its first tag was restored")
         } finally {
             cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * Several consumers of the same queue on the channel, whose queue is gone for good: the broker cancels each of
+     * them, and each is told exactly once, even when the cancellation callback of one of them throws. The channel is
+     * open again, and its consumer of another queue keeps receiving.
+     */
+    @Test
+    fun everyConsumerOfAGoneQueueIsToldOnceEvenIfACallbackThrows(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 300.milliseconds
+                reconnectMaxDelay = 300.milliseconds
+            }
+        }
+        val connection = ConsumeCountingConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-gone-several-${Uuid.random()}"
+        val otherQueue = "test-broker-cancel-gone-several-other-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            adminChannel.queueDeclare(otherQueue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as ConsumeCountingChannel
+            val otherReceiver = channel.basicConsume(queue = otherQueue, noAck = true, arguments = emptyMap())
+            val cancellations = List(5) { mutableListOf<AMQPResponse.Channel>() }
+            val consumerTags = cancellations.mapIndexed { index, received ->
+                channel.basicConsume(
+                    queue = queue,
+                    noAck = true,
+                    arguments = emptyMap(),
+                    onDelivery = {},
+                    onCanceled = {
+                        received += it
+                        // The first consumer's callback fails: the others must still be told.
+                        if (index == 0) throw IllegalStateException("Callback failure")
+                    }
+                ).consumerTag
+            }
+            assertEquals(5u, adminChannel.consumerCount(queue))
+
+            adminChannel.queueDelete(queue)
+
+            withTimeoutOrNull(5.seconds) { while (cancellations.any { it.isEmpty() }) delay(50) }
+            awaitRestored(channel)
+            delay(1.seconds) // Leaves time for a second, wrong, cancellation.
+            cancellations.forEachIndexed { index, received ->
+                assertEquals(1, received.size, "Consumer $index was not told exactly once its queue is gone: $received")
+                val canceled = assertIs<AMQPResponse.Channel.Basic.Canceled>(received.single())
+                assertEquals(consumerTags[index], canceled.consumerTag, "Consumer $index was told with another tag")
+            }
+
+            assertEquals(ConnectionState.OPEN, channel.state, "The channel was left closed")
+            adminChannel.basicPublish("After queue gone".toByteArray(), exchange = "", routingKey = otherQueue)
+            val delivery = withTimeoutOrNull(5.seconds) { otherReceiver.receive() }
+            assertNotNull(delivery, "The consumer of another queue did not receive its message")
+            assertEquals("After queue gone", delivery.message.body.decodeToString())
+
+            val restoreConsumeCalls = channel.restoreConsumeCalls
+            delay(1.seconds)
+            assertEquals(restoreConsumeCalls, channel.restoreConsumeCalls, "The channel was restored in a loop")
+            // The five consumes again are made one at a time: the first is refused, and the others find their consumer
+            // already forgotten.
+            assertEquals(7, channel.consumeCalls, "Expected the six consumes of the application and one consume again")
+        } finally {
+            runCatching { withTimeout(5.seconds) { admin.openChannel().queueDelete(otherQueue) } }
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * Two queues consumed on the same channel are gone at once (e.g. a node that hosted both is lost): the restore
+     * that follows the first refused consume must not be refused in a loop on the second queue, whose consumer is
+     * told too.
+     */
+    @Test
+    fun consumersOfTwoQueuesGoneAtOnceAreBothTold(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 300.milliseconds
+                reconnectMaxDelay = 300.milliseconds
+            }
+        }
+        val connection = ConsumeCountingConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-two-gone-${Uuid.random()}"
+        val secondQueue = "test-broker-cancel-two-gone-second-${Uuid.random()}"
+        val otherQueue = "test-broker-cancel-two-gone-other-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            listOf(queue, secondQueue, otherQueue).forEach {
+                adminChannel.queueDeclare(it, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            }
+
+            connection.connect()
+            val channel = connection.openChannel() as ConsumeCountingChannel
+            val otherReceiver = channel.basicConsume(queue = otherQueue, noAck = true, arguments = emptyMap())
+            val receiver = channel.basicConsume(queue = queue, noAck = true, arguments = emptyMap())
+            val secondReceiver = channel.basicConsume(queue = secondQueue, noAck = true, arguments = emptyMap())
+
+            adminChannel.queueDelete(queue)
+            adminChannel.queueDelete(secondQueue)
+
+            withTimeoutOrNull(10.seconds) {
+                while (!receiver.isClosedForReceive || !secondReceiver.isClosedForReceive) delay(50)
+            }
+            assertTrue(receiver.isClosedForReceive, "The consumer of the first queue was not told it is gone")
+            assertTrue(secondReceiver.isClosedForReceive, "The consumer of the second queue was not told it is gone")
+
+            awaitRestored(channel)
+            assertEquals(ConnectionState.OPEN, channel.state, "The channel was left closed")
+            val restoreConsumeCalls = channel.restoreConsumeCalls
+            delay(2.seconds)
+            assertEquals(restoreConsumeCalls, channel.restoreConsumeCalls, "The channel was restored in a loop")
+            assertEquals(1u, adminChannel.consumerCount(otherQueue), "The consumer of another queue was dropped")
+            adminChannel.basicPublish("After two queues gone".toByteArray(), exchange = "", routingKey = otherQueue)
+            val delivery = withTimeoutOrNull(5.seconds) { otherReceiver.receive() }
+            assertNotNull(delivery, "The consumer of another queue did not receive its message")
+        } finally {
+            runCatching {
+                withTimeout(5.seconds) {
+                    admin.openChannel().queueDelete(secondQueue)
+                    admin.openChannel().queueDelete(otherQueue)
+                }
+            }
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * A consumer consumed again once (the broker gave it a new tag) whose queue is then gone for good is told with the
+     * tag the application received, the only one it knows.
+     */
+    @Test
+    fun consumerOfAGoneQueueIsToldWithTheTagItWasGiven(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val connection = createRobustAMQPConnection(scope) {
+            server {
+                reconnectInitialDelay = 300.milliseconds
+                reconnectMaxDelay = 300.milliseconds
+            }
+        }
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-gone-first-tag-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            val channel = connection.openChannel()
+            val canceled = CompletableDeferred<AMQPResponse.Channel>()
+            val consumeOk = channel.basicConsume(
+                queue = queue,
+                noAck = true,
+                arguments = emptyMap(),
+                onDelivery = {},
+                onCanceled = { canceled.complete(it) }
+            )
+            // Consumed again, under a new tag.
+            adminChannel.queueDelete(queue)
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            withTimeoutOrNull(10.seconds) { while (adminChannel.consumerCount(queue) == 0u) delay(100) }
+            assertEquals(1u, adminChannel.consumerCount(queue), "The queue was not consumed again after basic.cancel")
+
+            // Then gone for good.
+            adminChannel.queueDelete(queue)
+            val response = withTimeoutOrNull(5.seconds) { canceled.await() }
+            val cancellation = assertIs<AMQPResponse.Channel.Basic.Canceled>(response, "The consumer was not told")
+            assertEquals(consumeOk.consumerTag, cancellation.consumerTag, "The consumer was told with a tag it does not know")
+        } finally {
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * The application closes the channel while the consume made again after a `basic.cancel` from the broker is under
+     * way: the consume fails on the closed channel, and the consumer is told, once, instead of being left silent.
+     */
+    @Test
+    fun consumerIsToldWhenTheApplicationClosesTheChannelDuringTheConsumeAgain(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 300.milliseconds
+            }
+        }
+        val connection = ConsumeCountingConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-close-during-consume-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as ConsumeCountingChannel
+            val cancellations = mutableListOf<AMQPResponse.Channel>()
+            channel.basicConsume(
+                queue = queue,
+                noAck = true,
+                arguments = emptyMap(),
+                onDelivery = {},
+                onCanceled = { cancellations += it }
+            )
+            val consumeFailure = CompletableDeferred<Throwable>()
+            channel.aroundNextConsume = { consume ->
+                channel.close()
+                try {
+                    consume()
+                } catch (e: Exception) {
+                    consumeFailure.complete(e)
+                    throw e
+                }
+            }
+
+            adminChannel.queueDelete(queue)
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            assertIs<AMQPException.ChannelClosed>(withTimeoutOrNull(5.seconds) { consumeFailure.await() })
+            withTimeoutOrNull(5.seconds) { while (cancellations.isEmpty()) delay(50) }
+            delay(500.milliseconds)
+            assertEquals(1, cancellations.size, "The consumer was not told exactly once: $cancellations")
+            assertIs<AMQPResponse.Channel.Basic.Canceled>(cancellations.single())
+            assertEquals(0, channel.restoreConsumeCalls, "A channel closed by the application was restored")
+            assertEquals(0u, adminChannel.consumerCount(queue), "The queue was consumed on a closed channel")
+        } finally {
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * The application is closing the channel (its close is sent, not answered yet) when the consume would be made
+     * again after a `basic.cancel` from the broker: the queue is not consumed again, and the consumer is told.
+     */
+    @Test
+    fun consumerIsToldWhenTheApplicationIsClosingTheChannel(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 500.milliseconds
+            }
+        }
+        val connection = ConsumeCountingConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-while-closing-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as ConsumeCountingChannel
+            val canceled = CompletableDeferred<AMQPResponse.Channel>()
+            channel.basicConsume(
+                queue = queue,
+                noAck = true,
+                arguments = emptyMap(),
+                onDelivery = {},
+                onCanceled = { canceled.complete(it) }
+            )
+
+            adminChannel.queueDelete(queue)
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            withTimeout(5.seconds) { while (adminChannel.consumerCount(queue) != 0u) delay(20) }
+
+            val release = CompletableDeferred<Unit>()
+            channel.holdNextClose = release
+            val close = scope.launch { channel.close() }
+            channel.closing.await()
+
+            val response = withTimeoutOrNull(5.seconds) { canceled.await() }
+            assertIs<AMQPResponse.Channel.Basic.Canceled>(response, "The consumer was not told while the channel closes")
+            assertEquals(1, channel.consumeCalls, "The queue was consumed again on a channel being closed")
+
+            release.complete(Unit)
+            withTimeout(5.seconds) { close.join() }
+            assertEquals(0u, adminChannel.consumerCount(queue))
+        } finally {
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * The connection drops while the consume made again after a `basic.cancel` from the broker waits for its reply:
+     * the consumer is kept, not told, and the reconnect restores it.
+     */
+    @Test
+    fun consumerIsRestoredWhenTheConnectionDropsDuringTheConsumeAgain(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 300.milliseconds
+            }
+        }
+        val connection = ConsumeCountingConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-drop-during-consume-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as ConsumeCountingChannel
+            val canceled = CompletableDeferred<AMQPResponse.Channel>()
+            val deliveries = kotlinx.coroutines.channels.Channel<String>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+            channel.basicConsume(
+                queue = queue,
+                noAck = true,
+                arguments = emptyMap(),
+                onDelivery = { deliveries.send(it.message.body.decodeToString()) },
+                onCanceled = { canceled.complete(it) }
+            )
+            val consumeFailure = CompletableDeferred<Throwable>()
+            channel.aroundNextConsume = { consume ->
+                // Heartbeat on a non-zero channel forces broker to close the connection.
+                connection.write(Frame(channelId = channel.id, payload = Frame.Heartbeat))
+                try {
+                    consume()
+                } catch (e: Exception) {
+                    consumeFailure.complete(e)
+                    throw e
+                }
+            }
+
+            adminChannel.queueDelete(queue)
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            assertNotNull(withTimeoutOrNull(5.seconds) { consumeFailure.await() }, "The consume again did not fail")
+            withTimeoutOrNull(10.seconds) { while (adminChannel.consumerCount(queue) == 0u) delay(100) }
+            assertEquals(1u, adminChannel.consumerCount(queue), "The reconnect did not restore the consumer")
+            awaitRestored(channel)
+            adminChannel.basicPublish("After the drop".toByteArray(), exchange = "", routingKey = queue)
+            assertEquals("After the drop", withTimeoutOrNull(5.seconds) { deliveries.receive() })
+            assertTrue(!canceled.isCompleted, "A consumer restored by the reconnect was told it is cancelled")
+        } finally {
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * The broker refuses the consume made again with 404 NOT_FOUND, and the connection drops right after: the queue is
+     * still gone, so the consumer is told, and the reconnect restores the channel without it, instead of being refused
+     * in a loop.
+     */
+    @Test
+    fun consumerOfAGoneQueueIsToldWhenTheConnectionDropsAfterTheRefusal(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 300.milliseconds
+                reconnectMaxDelay = 300.milliseconds
+            }
+        }
+        val connection = ConsumeCountingConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-gone-then-drop-${Uuid.random()}"
+        val otherQueue = "test-broker-cancel-gone-then-drop-other-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            adminChannel.queueDeclare(otherQueue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as ConsumeCountingChannel
+            val otherReceiver = channel.basicConsume(queue = otherQueue, noAck = true, arguments = emptyMap())
+            val receiver = channel.basicConsume(queue = queue, noAck = true, arguments = emptyMap())
+            val refusal = CompletableDeferred<AMQPException.ChannelClosed>()
+            channel.aroundNextConsume = { consume ->
+                try {
+                    consume()
+                } catch (e: AMQPException.ChannelClosed) {
+                    refusal.complete(e)
+                    // Heartbeat on a non-zero channel forces broker to close the connection. Not on this channel,
+                    // whose frames the broker discards until the client acknowledges its close.
+                    connection.write(Frame(channelId = (channel.id + 1u).toUShort(), payload = Frame.Heartbeat))
+                    withTimeout(5.seconds) { while (connection.state == ConnectionState.OPEN) delay(10) }
+                    throw e
+                }
+            }
+
+            adminChannel.queueDelete(queue)
+
+            assertEquals(404.toUShort(), withTimeoutOrNull(5.seconds) { refusal.await() }?.replyCode)
+            withTimeoutOrNull(5.seconds) { while (!receiver.isClosedForReceive) delay(50) }
+            assertTrue(receiver.isClosedForReceive, "The consumer was not told its queue is gone")
+
+            awaitRestored(channel)
+            assertEquals(ConnectionState.OPEN, channel.state, "The channel was left closed")
+            val restoreConsumeCalls = channel.restoreConsumeCalls
+            delay(2.seconds)
+            assertEquals(restoreConsumeCalls, channel.restoreConsumeCalls, "The channel was restored in a loop")
+            adminChannel.basicPublish("After the drop".toByteArray(), exchange = "", routingKey = otherQueue)
+            val delivery = withTimeoutOrNull(5.seconds) { otherReceiver.receive() }
+            assertNotNull(delivery, "The consumer of another queue was not restored by the reconnect")
+        } finally {
+            runCatching { withTimeout(5.seconds) { admin.openChannel().queueDelete(otherQueue) } }
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * The consume made again after a `basic.cancel` from the broker gets no reply in time: the broker may still
+     * register it, and nothing else would consume the queue again. The connection is recovered, as after a restore
+     * that stalls, and the reconnect restores the consumer.
+     */
+    @Test
+    fun consumeAgainLeftWithoutAReplyIsRecoveredByAReconnect(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 300.milliseconds
+            }
+        }
+        val connection = ConsumeCountingConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-consume-timeout-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as ConsumeCountingChannel
+            val canceled = CompletableDeferred<AMQPResponse.Channel>()
+            val deliveries = kotlinx.coroutines.channels.Channel<String>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+            channel.basicConsume(
+                queue = queue,
+                noAck = true,
+                arguments = emptyMap(),
+                onDelivery = { deliveries.send(it.message.body.decodeToString()) },
+                onCanceled = { canceled.complete(it) }
+            )
+            val timedOut = CompletableDeferred<Unit>()
+            channel.aroundNextConsume = {
+                timedOut.complete(Unit)
+                throw AMQPException.RpcTimeout(channelId = channel.id, timeout = 1.seconds)
+            }
+
+            adminChannel.queueDelete(queue)
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            withTimeout(5.seconds) { timedOut.await() }
+
+            withTimeoutOrNull(10.seconds) { while (adminChannel.consumerCount(queue) == 0u) delay(100) }
+            assertEquals(1u, adminChannel.consumerCount(queue), "A consume again left without a reply was never made again")
+            awaitRestored(channel)
+            adminChannel.basicPublish("After the timeout".toByteArray(), exchange = "", routingKey = queue)
+            assertEquals("After the timeout", withTimeoutOrNull(5.seconds) { deliveries.receive() })
+            assertTrue(!canceled.isCompleted, "A consumer recovered by the reconnect was told it is cancelled")
+        } finally {
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * Several consumers on the channel, one consumed again under a new tag: cancelling another one by its tag leaves
+     * the consumer consumed again running, cancelling that one by its first tag stops it, a second cancel of a
+     * consumer already cancelled does nothing, and the reconnect restores none of them.
+     */
+    @Test
+    fun consumersOfAChannelAreCancelledIndependentlyByTheirTags(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val connection = createRobustAMQPConnection(scope) {
+            server {
+                reconnectInitialDelay = 300.milliseconds
+            }
+        }
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-independent-${Uuid.random()}"
+        val otherQueue = "test-broker-cancel-independent-other-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            adminChannel.queueDeclare(otherQueue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            val channel = connection.openChannel()
+            val deliveries = kotlinx.coroutines.channels.Channel<String>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+            val consumeOk = channel.basicConsume(
+                queue = queue,
+                noAck = true,
+                arguments = emptyMap(),
+                onDelivery = { deliveries.send(it.message.body.decodeToString()) },
+            )
+            val firstOther = channel.basicConsume(queue = otherQueue, noAck = true, arguments = emptyMap(), onDelivery = {})
+            val secondOther = channel.basicConsume(queue = otherQueue, noAck = true, arguments = emptyMap(), onDelivery = {})
+
+            adminChannel.queueDelete(queue)
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            withTimeoutOrNull(10.seconds) { while (adminChannel.consumerCount(queue) == 0u) delay(100) }
+            assertEquals(1u, adminChannel.consumerCount(queue), "The queue was not consumed again after basic.cancel")
+
+            channel.basicCancel(secondOther.consumerTag)
+            assertEquals(1u, adminChannel.consumerCount(otherQueue), "Cancelling a consumer stopped another one")
+            assertEquals(1u, adminChannel.consumerCount(queue), "Cancelling another consumer stopped the one consumed again")
+            adminChannel.basicPublish("Still consumed".toByteArray(), exchange = "", routingKey = queue)
+            assertEquals("Still consumed", withTimeoutOrNull(5.seconds) { deliveries.receive() })
+
+            channel.basicCancel(consumeOk.consumerTag)
+            channel.basicCancel(firstOther.consumerTag)
+            assertEquals(0u, adminChannel.consumerCount(queue), "Cancelling by the first tag left the consumer running")
+            assertEquals(0u, adminChannel.consumerCount(otherQueue))
+
+            // Already cancelled: nothing to do, and the channel stays open.
+            channel.basicCancel(consumeOk.consumerTag)
+            channel.basicCancel(secondOther.consumerTag)
+            assertEquals(ConnectionState.OPEN, channel.state)
+
+            // Heartbeat on a non-zero channel forces broker to close the connection.
+            connection.write(Frame(channelId = 1u, payload = Frame.Heartbeat))
+            delay(500.milliseconds)
+            awaitRestored(channel)
+            assertEquals(0u, adminChannel.consumerCount(queue), "A cancelled consumer was restored")
+            assertEquals(0u, adminChannel.consumerCount(otherQueue), "A cancelled consumer was restored")
+        } finally {
+            runCatching { withTimeout(5.seconds) { admin.openChannel().queueDelete(otherQueue) } }
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * A delivery is being processed when the queue is gone for good: its handler, which does not let itself be
+     * cancelled, acks it once the channel has been restored without the queue. That ack is from before the restore:
+     * it is ignored instead of closing the channel again, and the other consumer keeps receiving.
+     */
+    @Test
+    fun deliveryInProgressWhenTheQueueIsGoneIsAckedWithoutClosingTheChannel(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 300.milliseconds
+                reconnectMaxDelay = 300.milliseconds
+            }
+        }
+        val connection = ConsumeCountingConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-gone-delivery-${Uuid.random()}"
+        val otherQueue = "test-broker-cancel-gone-delivery-other-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            adminChannel.queueDeclare(otherQueue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as ConsumeCountingChannel
+            val otherReceiver = channel.basicConsume(queue = otherQueue, noAck = true, arguments = emptyMap())
+            val started = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val acked = CompletableDeferred<Unit>()
+            val canceled = CompletableDeferred<AMQPResponse.Channel>()
+            channel.basicConsume(
+                queue = queue,
+                noAck = false,
+                arguments = emptyMap(),
+                onDelivery = { delivery ->
+                    withContext(NonCancellable) {
+                        started.complete(Unit)
+                        release.await()
+                        channel.basicAck(delivery.message.deliveryTag)
+                        acked.complete(Unit)
+                    }
+                },
+                onCanceled = { canceled.complete(it) }
+            )
+            adminChannel.basicPublish("In progress".toByteArray(), exchange = "", routingKey = queue)
+            withTimeout(5.seconds) { started.await() }
+
+            adminChannel.queueDelete(queue)
+            assertIs<AMQPResponse.Channel.Basic.Canceled>(withTimeoutOrNull(5.seconds) { canceled.await() })
+            awaitRestored(channel)
+
+            release.complete(Unit)
+            withTimeout(5.seconds) { acked.await() }
+            delay(500.milliseconds)
+            assertEquals(ConnectionState.OPEN, channel.state, "The ack of the delivery in progress closed the channel")
+            adminChannel.basicPublish("After the ack".toByteArray(), exchange = "", routingKey = otherQueue)
+            val delivery = withTimeoutOrNull(5.seconds) { otherReceiver.receive() }
+            assertNotNull(delivery, "The other consumer of the channel did not receive its message")
+            assertEquals("After the ack", delivery.message.body.decodeToString())
+        } finally {
+            runCatching { withTimeout(5.seconds) { admin.openChannel().queueDelete(otherQueue) } }
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * A delivery is being processed when the queue is deleted and declared again: the handler acks it after the
+     * consumer was consumed again, without closing the channel, and the consumer receives the next messages.
+     */
+    @Test
+    fun deliveryInProgressWhenTheQueueComesBackIsAckedAndTheConsumerKeepsReceiving(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val connection = createRobustAMQPConnection(scope) {
+            server {
+                reconnectInitialDelay = 300.milliseconds
+            }
+        }
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-back-delivery-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            val channel = connection.openChannel()
+            val started = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val deliveries = kotlinx.coroutines.channels.Channel<String>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+            channel.basicConsume(
+                queue = queue,
+                noAck = false,
+                arguments = emptyMap(),
+                onDelivery = { delivery ->
+                    withContext(NonCancellable) {
+                        if (started.complete(Unit)) release.await()
+                        channel.basicAck(delivery.message.deliveryTag)
+                        deliveries.send(delivery.message.body.decodeToString())
+                    }
+                },
+            )
+            adminChannel.basicPublish("In progress".toByteArray(), exchange = "", routingKey = queue)
+            withTimeout(5.seconds) { started.await() }
+
+            adminChannel.queueDelete(queue)
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            withTimeoutOrNull(10.seconds) { while (adminChannel.consumerCount(queue) == 0u) delay(100) }
+            assertEquals(1u, adminChannel.consumerCount(queue), "The queue was not consumed again after basic.cancel")
+
+            release.complete(Unit)
+            assertEquals("In progress", withTimeoutOrNull(5.seconds) { deliveries.receive() })
+            adminChannel.basicPublish("Next".toByteArray(), exchange = "", routingKey = queue)
+            assertEquals("Next", withTimeoutOrNull(5.seconds) { deliveries.receive() }, "The consumer stopped receiving")
+            delay(500.milliseconds)
+            assertEquals(ConnectionState.OPEN, channel.state, "The ack of the delivery in progress closed the channel")
+        } finally {
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * The connection drops while a consumer the broker cancelled waits to be consumed again, and the broker stays
+     * unreachable past that wait: the consume is not made on the closed channel, and the consumer, kept, is restored
+     * by the reconnect.
+     */
+    @Test
+    fun consumerWaitingToBeConsumedAgainIsRestoredByALateReconnect(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 300.milliseconds
+            }
+        }
+        val connection = ConsumeCountingConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-late-reconnect-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as ConsumeCountingChannel
+            val canceled = CompletableDeferred<AMQPResponse.Channel>()
+            val deliveries = kotlinx.coroutines.channels.Channel<String>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+            channel.basicConsume(
+                queue = queue,
+                noAck = true,
+                arguments = emptyMap(),
+                onDelivery = { deliveries.send(it.message.body.decodeToString()) },
+                onCanceled = { canceled.complete(it) }
+            )
+
+            adminChannel.queueDelete(queue)
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            withTimeout(5.seconds) { while (adminChannel.consumerCount(queue) != 0u) delay(20) }
+            val release = CompletableDeferred<Unit>()
+            connection.holdNextReconnect = release
+            // Heartbeat on a non-zero channel forces broker to close the connection.
+            connection.write(Frame(channelId = channel.id, payload = Frame.Heartbeat))
+            withTimeout(5.seconds) { connection.reconnecting.await() }
+
+            // Past the wait before the consume again.
+            delay(1.seconds)
+            assertEquals(1, channel.consumeCalls, "The queue was consumed again on a closed connection")
+
+            release.complete(Unit)
+            withTimeoutOrNull(10.seconds) { while (adminChannel.consumerCount(queue) == 0u) delay(100) }
+            assertEquals(1u, adminChannel.consumerCount(queue), "The reconnect did not restore the consumer")
+            awaitRestored(channel)
+            adminChannel.basicPublish("After the reconnect".toByteArray(), exchange = "", routingKey = queue)
+            assertEquals("After the reconnect", withTimeoutOrNull(5.seconds) { deliveries.receive() })
+            assertTrue(!canceled.isCompleted, "A consumer restored by the reconnect was told it is cancelled")
+        } finally {
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * The consume made again fails once the connection it was made on has been replaced by the reconnect (e.g. its
+     * write failed on the old socket): the new connection is left alone, and restores the consumer.
+     */
+    @Test
+    fun consumeAgainFailingOnAReplacedConnectionDoesNotReconnectAgain(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 300.milliseconds
+            }
+        }
+        val connection = ConsumeCountingConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-replaced-connection-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as ConsumeCountingChannel
+            val deliveries = kotlinx.coroutines.channels.Channel<String>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+            channel.basicConsume(
+                queue = queue,
+                noAck = true,
+                arguments = emptyMap(),
+                onDelivery = { deliveries.send(it.message.body.decodeToString()) },
+            )
+            channel.aroundNextConsume = {
+                val iteration = connection.currentIteration
+                // Heartbeat on a non-zero channel forces broker to close the connection.
+                connection.write(Frame(channelId = channel.id, payload = Frame.Heartbeat))
+                withTimeout(5.seconds) { while (connection.currentIteration === iteration) delay(10) }
+                throw IllegalStateException("Write failed on the previous socket")
+            }
+
+            adminChannel.queueDelete(queue)
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            withTimeoutOrNull(10.seconds) { while (adminChannel.consumerCount(queue) == 0u) delay(100) }
+            assertEquals(1u, adminChannel.consumerCount(queue), "The reconnect did not restore the consumer")
+            awaitRestored(channel)
+            delay(1.seconds)
+            assertEquals(2, connection.openConnectionCount, "The new connection was dropped again")
+            adminChannel.basicPublish("After the reconnect".toByteArray(), exchange = "", routingKey = queue)
+            assertEquals("After the reconnect", withTimeoutOrNull(5.seconds) { deliveries.receive() })
+        } finally {
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * The application cancels the consumer, then closes the channel, while the consume made again is under way: the
+     * consumer is told once, by its own cancel, and not a second time when the consume fails on the closed channel.
+     */
+    @Test
+    fun consumerCancelledThenClosedDuringTheConsumeAgainIsToldOnce(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 300.milliseconds
+            }
+        }
+        val connection = ConsumeCountingConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-cancel-then-close-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as ConsumeCountingChannel
+            val cancellations = mutableListOf<AMQPResponse.Channel>()
+            val consumeOk = channel.basicConsume(
+                queue = queue,
+                noAck = true,
+                arguments = emptyMap(),
+                onDelivery = {},
+                onCanceled = { cancellations += it }
+            )
+            val consumeFailure = CompletableDeferred<Throwable>()
+            channel.aroundNextConsume = { consume ->
+                channel.basicCancel(consumeOk.consumerTag)
+                channel.close()
+                try {
+                    consume()
+                } catch (e: Exception) {
+                    consumeFailure.complete(e)
+                    throw e
+                }
+            }
+
+            adminChannel.queueDelete(queue)
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            assertIs<AMQPException.ChannelClosed>(withTimeoutOrNull(5.seconds) { consumeFailure.await() })
+            delay(500.milliseconds)
+            assertEquals(1, cancellations.size, "The consumer was not told exactly once: $cancellations")
+            assertEquals(0u, adminChannel.consumerCount(queue), "The queue was consumed on a closed channel")
+        } finally {
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * The consumer of a server-named queue that another client deletes is cancelled by the broker, and the connection
+     * drops before it is consumed again: the reconnect declares a new queue, with its bindings, and consumes it, and
+     * the consume made again then leaves it alone.
+     */
+    @Test
+    fun consumerOfAServerNamedQueueCancelledByTheBrokerIsRestoredByAReconnect(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 1.seconds
+            }
+        }
+        val connection = ConsumeCountingConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val routingKey = "test-broker-cancel-server-named-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            connection.connect()
+            val channel = connection.openChannel() as ConsumeCountingChannel
+            val queue = channel.queueDeclare("", durable = false, exclusive = false, autoDelete = true, arguments = emptyMap())
+            channel.queueBind(queue.queueName, exchange = "amq.direct", routingKey = routingKey, arguments = emptyMap())
+            val canceled = CompletableDeferred<AMQPResponse.Channel>()
+            val deliveries = kotlinx.coroutines.channels.Channel<String>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+            channel.basicConsume(
+                queue = queue.queueName,
+                noAck = true,
+                arguments = emptyMap(),
+                onDelivery = { deliveries.send(it.message.body.decodeToString()) },
+                onCanceled = { canceled.complete(it) }
+            )
+
+            adminChannel.queueDelete(queue.queueName)
+            delay(100.milliseconds) // The broker's basic.cancel reaches the channel.
+            // Heartbeat on a non-zero channel forces broker to close the connection.
+            connection.write(Frame(channelId = channel.id, payload = Frame.Heartbeat))
+            delay(300.milliseconds)
+            awaitRestored(channel)
+            // Past the wait before the consume again, which finds the consumer restored.
+            delay(1.seconds)
+            assertEquals(1, channel.consumeCalls, "A consumer restored by the reconnect was consumed again")
+
+            adminChannel.basicPublish("To the new queue".toByteArray(), exchange = "amq.direct", routingKey = routingKey)
+            assertEquals("To the new queue", withTimeoutOrNull(5.seconds) { deliveries.receive() })
+            assertTrue(!canceled.isCompleted, "A consumer restored by the reconnect was told it is cancelled")
+        } finally {
+            runCatching {
+                withTimeout(5.seconds) {
+                    admin.close()
+                    connection.close()
+                }
+            }
             scope.cancel()
         }
     }
