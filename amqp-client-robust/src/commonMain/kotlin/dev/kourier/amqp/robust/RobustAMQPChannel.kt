@@ -128,8 +128,9 @@ open class RobustAMQPChannel(
 
     // Consumers of [brokerCancelledConsumers] that the application cancelled, or whose queue it deleted, while a
     // `basic.consume` may be consuming them again: that consume, once answered, is cancelled instead of recorded (see
-    // [consumedAgain]). Guarded by consumersMutex.
-    private val cancelledWhileConsumedAgain = mutableSetOf<Pair<String, String>>()
+    // [consumedAgain]). Keyed like consumedQueues, with the consumer cancelled: a consumer the application registers
+    // later under the same key is another one. Guarded by consumersMutex.
+    private val cancelledWhileConsumedAgain = mutableMapOf<Pair<String, String>, ConsumedQueue>()
     private val consumersMutex = Mutex()
 
     // The restore has just forgotten a queue it found gone (see [restoreConsumers]): the refusal of the restore is
@@ -413,23 +414,24 @@ open class RobustAMQPChannel(
     )
 
     /**
-     * Forgets the consumers of [cancelledWhileConsumedAgain] that are no longer registered: no consume can be
-     * consuming them again, since the caller holds [restoreLatch].
+     * Forgets the consumers of [cancelledWhileConsumedAgain] that are no longer registered, or replaced by another
+     * consumer under the same key: no consume can be consuming them again, since the caller holds [restoreLatch].
      */
     private suspend fun pruneCancelledWhileConsumedAgain() = consumersMutex.withLock {
-        cancelledWhileConsumedAgain.retainAll { it in consumedQueues }
+        cancelledWhileConsumedAgain.entries.removeAll { (key, consumedQueue) -> consumedQueues[key] !== consumedQueue }
     }
 
     /**
      * Records that the consumer registered under [previousKey] runs again with [consumerTag], which [basicConsume]
      * has just registered: drops the previous entry if the broker generated a new tag, and remembers the tag the
-     * application knows the consumer by. Returns false if the application cancelled the consumer meanwhile, and has
-     * been told: the consumer that runs again is then cancelled, and not recorded.
+     * application knows the consumer by. Returns false if the application cancelled the consumer
+     * meanwhile, and has been told: the consumer that runs again is then cancelled, and not recorded.
      */
     private suspend fun consumedAgain(previousKey: Pair<String, String>, consumerTag: String): Boolean {
         val cancelledMeanwhile = consumersMutex.withLock {
             brokerCancelledConsumers.remove(previousKey)
-            cancelledWhileConsumedAgain.remove(previousKey).also { cancelled ->
+            // Cancelled during this consume: the entries left from before were pruned when it started.
+            (cancelledWhileConsumedAgain.remove(previousKey) != null).also { cancelled ->
                 if (!cancelled && consumerTag != previousKey.second) {
                     firstConsumerTags[consumerTag] = firstConsumerTags.remove(previousKey.second) ?: previousKey.second
                 }
@@ -495,7 +497,9 @@ open class RobustAMQPChannel(
      */
     private suspend fun takeOverBrokerCancelled(keys: List<Pair<String, String>>): List<Pair<String, String>> =
         consumersMutex.withLock {
-            keys.filter { brokerCancelledConsumers.remove(it) }.onEach { cancelledWhileConsumedAgain += it }
+            keys.filter { brokerCancelledConsumers.remove(it) }.onEach { key ->
+                consumedQueues[key]?.let { cancelledWhileConsumedAgain[key] = it }
+            }
         }
 
     /**
@@ -670,13 +674,14 @@ open class RobustAMQPChannel(
 
     /**
      * Drops the consumers of [queue], which the application deletes. Those the broker cancelled already, which wait
-     * to be consumed again, are told: their listener is gone with that cancel.
+     * to be consumed again, are told, as the broker's cancel tells the others: their listener is gone with that
+     * cancel. Not inline, as the delete does not wait for the cancellations of the others either.
      */
     private suspend fun removeConsumers(queue: String) {
         val keys = consumedQueues.keys.filter { it.first == queue }
         val cancelled = takeOverBrokerCancelled(keys).mapNotNull { cancelConsumer(it) }
         keys.forEach { removeConsumer(it) }
-        forwardCancellations(cancelled)
+        if (cancelled.isNotEmpty()) connection.messageListeningScope.launch { forwardCancellations(cancelled) }
     }
 
     override suspend fun queueBind(

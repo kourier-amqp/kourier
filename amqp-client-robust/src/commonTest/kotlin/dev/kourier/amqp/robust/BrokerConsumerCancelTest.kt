@@ -1560,8 +1560,16 @@ class BrokerConsumerCancelTest {
     fun consumerCancelledByTheApplicationAfterTheConsumeAgainIsAnsweredIsNotLeftRunning() =
         consumerCancelledByTheApplicationDuringTheConsumeAgainIsNotLeftRunning(beforeTheReply = false)
 
+    /**
+     * The same, for a consumer with a tag of its own, which the consume made again registers anew under the same key.
+     */
+    @Test
+    fun consumerWithItsOwnTagCancelledAfterTheConsumeAgainIsAnsweredIsNotLeftRunning() =
+        consumerCancelledByTheApplicationDuringTheConsumeAgainIsNotLeftRunning(beforeTheReply = false, consumerTag = "own-tag")
+
     private fun consumerCancelledByTheApplicationDuringTheConsumeAgainIsNotLeftRunning(
         beforeTheReply: Boolean,
+        consumerTag: String = "",
     ): Unit = runBlocking {
         val scope = CoroutineScope(coroutineContext + SupervisorJob())
         val config = amqpConfig {
@@ -1581,6 +1589,7 @@ class BrokerConsumerCancelTest {
             val cancellations = mutableListOf<AMQPResponse.Channel>()
             val consumeOk = channel.basicConsume(
                 queue = queue,
+                consumerTag = consumerTag,
                 noAck = true,
                 arguments = emptyMap(),
                 onDelivery = {},
@@ -1699,6 +1708,7 @@ class BrokerConsumerCancelTest {
             delay(100.milliseconds) // The broker's basic.cancel reaches the channel.
 
             channel.queueDelete(queue)
+            withTimeoutOrNull(5.seconds) { while (cancellations.isEmpty()) delay(20) }
             assertEquals(
                 listOf<AMQPResponse.Channel>(AMQPResponse.Channel.Basic.Canceled(consumeOk.consumerTag)),
                 cancellations,
@@ -1708,6 +1718,59 @@ class BrokerConsumerCancelTest {
             assertEquals(1, cancellations.size, "The consumer was told again")
             assertEquals(1, channel.consumeCalls, "The queue deleted by the application was consumed again")
             assertEquals(ConnectionState.OPEN, channel.state)
+        } finally {
+            cleanUp(admin, connection, queue)
+            scope.cancel()
+        }
+    }
+
+    /**
+     * The application cancels a consumer with a tag of its own while it waits to be consumed again, then consumes the
+     * queue again under the same tag: that new consumer is another one, and a later `basic.cancel` from the broker
+     * consumes it again instead of cancelling it silently.
+     */
+    @Test
+    fun consumerConsumedAgainUnderTheTagOfACancelledOneIsKept(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val connection = createRobustAMQPConnection(scope) {
+            server {
+                reconnectInitialDelay = 500.milliseconds
+            }
+        }
+        val admin = createAMQPConnection(scope)
+        val queue = "test-broker-cancel-reused-tag-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            val channel = connection.openChannel()
+            channel.basicConsume(queue = queue, consumerTag = "reused-tag", noAck = true, arguments = emptyMap(), onDelivery = {})
+            adminChannel.queueDelete(queue)
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            withTimeout(5.seconds) { while (adminChannel.consumerCount(queue) != 0u) delay(20) }
+            delay(100.milliseconds) // The broker's basic.cancel reaches the channel.
+            channel.basicCancel("reused-tag")
+
+            val canceled = CompletableDeferred<AMQPResponse.Channel>()
+            val deliveries = kotlinx.coroutines.channels.Channel<String>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+            channel.basicConsume(
+                queue = queue,
+                consumerTag = "reused-tag",
+                noAck = true,
+                arguments = emptyMap(),
+                onDelivery = { deliveries.send(it.message.body.decodeToString()) },
+                onCanceled = { canceled.complete(it) }
+            )
+            delay(1.seconds) // Past the wait of the first consumer's consume again.
+
+            adminChannel.queueDelete(queue)
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            withTimeoutOrNull(10.seconds) { while (adminChannel.consumerCount(queue) == 0u) delay(100) }
+            delay(500.milliseconds)
+            assertEquals(1u, adminChannel.consumerCount(queue), "The new consumer was not consumed again")
+            adminChannel.basicPublish("Still consumed".toByteArray(), exchange = "", routingKey = queue)
+            assertEquals("Still consumed", withTimeoutOrNull(5.seconds) { deliveries.receive() })
+            assertTrue(!canceled.isCompleted, "The new consumer was cancelled")
         } finally {
             cleanUp(admin, connection, queue)
             scope.cancel()
