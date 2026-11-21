@@ -196,7 +196,7 @@ open class RobustAMQPChannel(
     /**
      * Restores the channel. The caller holds [restoreLatch].
      */
-    private suspend fun restoreLocked() = withChannelRestoreContext {
+    private suspend fun restoreLocked(): Unit = withChannelRestoreContext {
         prepareForRestore()
 
         try {
