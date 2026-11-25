@@ -289,15 +289,24 @@ open class DefaultAMQPChannel(
     ): AMQPReceiveChannel {
         val deferredConsumeOk = CompletableDeferred<AMQPResponse.Channel.Basic.ConsumeOk>()
         val receiveChannel = connection.messageListeningScope.produce(capacity = Channel.UNLIMITED) {
-            val consumeOk = basicConsume(
-                queue = queue,
-                consumerTag = consumerTag,
-                noAck = noAck,
-                exclusive = exclusive,
-                arguments = arguments,
-                onDelivery = { trySend(it) },
-                onCanceled = { close() }
-            )
+            val consumeOk = try {
+                basicConsume(
+                    queue = queue,
+                    consumerTag = consumerTag,
+                    noAck = noAck,
+                    exclusive = exclusive,
+                    arguments = arguments,
+                    onDelivery = { trySend(it) },
+                    onCanceled = { close() }
+                )
+            } catch (e: Throwable) {
+                // No consume-ok will ever come (e.g. 404 NOT_FOUND closes the channel): fail the caller, which
+                // awaits deferredConsumeOk, instead of leaving it waiting forever.
+                deferredConsumeOk.completeExceptionally(e)
+                if (e is CancellationException) throw e
+                close(e)
+                return@produce
+            }
             deferredConsumeOk.complete(consumeOk)
             awaitClose {
                 // awaitClose's block is not a suspend context. The previous code used
@@ -349,6 +358,27 @@ open class DefaultAMQPChannel(
                 // (deferredListeningJob.cancel() below, and cancelAll() joining this job, both
                 // rely on cancellation actually stopping the collector).
                 try {
+                    // The channel closed before basicConsume got its consumer tag. The pending basic.consume RPC
+                    // runs cancelAll, which joins this job, before it can fail: awaiting the tag here would never
+                    // end, so this job stops at once. Whether the consume was refused (the usual case: a refused
+                    // consume closes the channel) or confirmed just before the close is only known once the RPC
+                    // returns, so onCanceled is called from outside this job, and only if the consume succeeded.
+                    if (response is AMQPResponse.Channel.Closed && !deferredConsumerTag.isCompleted) {
+                        connection.messageListeningScope.launch {
+                            // If the consume failed, there is no consumer to tell.
+                            val consumerTag = runCatching { deferredConsumerTag.await() }.getOrNull() ?: return@launch
+                            logger.debug("Consumer $consumerTag on channel $id canceled due to channel closed")
+                            try {
+                                onCanceled(response)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Throwable) {
+                                logger.error("Error in consumer $consumerTag on channel $id", e)
+                            }
+                        }
+                        deferredListeningJob.await().cancel()
+                        return@collect
+                    }
                     val consumerTag = deferredConsumerTag.await()
                     when (response) {
                         is AMQPResponse.Channel.Closed -> {
@@ -423,7 +453,16 @@ open class DefaultAMQPChannel(
                 arguments = arguments
             )
         )
-        val result = writeAndWaitForResponse<AMQPResponse.Channel.Basic.ConsumeOk>(consume)
+        val result = try {
+            writeAndWaitForResponse<AMQPResponse.Channel.Basic.ConsumeOk>(consume)
+        } catch (e: Throwable) {
+            // No consumer: the listener would wait for its tag forever, and close() joins every listener of the
+            // channel (cancelAll). It may not have seen the channel close (not subscribed yet), or the consume may
+            // have failed otherwise (e.g. RpcTimeout).
+            listeningJob.cancel()
+            deferredConsumerTag.completeExceptionally(e)
+            throw e
+        }
         deferredConsumerTag.complete(result.consumerTag)
         // Index by broker-confirmed consumerTag so basicCancel can join the right listener.
         listeningJobsMutex.withLock { listeningJobsByConsumer[result.consumerTag] = listeningJob }

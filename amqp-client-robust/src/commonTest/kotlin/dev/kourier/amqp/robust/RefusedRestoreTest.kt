@@ -162,6 +162,61 @@ class RefusedRestoreTest {
     }
 
     /**
+     * A channel restored by a retry after a refused restore closes: the listener of the refused `basic.consume`
+     * has no consumer and must not stay behind, or close(), which joins every listener of the channel, never
+     * returns.
+     */
+    @Test
+    fun channelRestoredAfterARefusedRestoreCanBeClosed(): Unit = runBlocking {
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val config = amqpConfig {
+            server {
+                reconnectInitialDelay = 200.milliseconds
+                reconnectMaxDelay = 200.milliseconds
+            }
+        }
+        val connection = RefusedRestoreConnection(config, scope)
+        val admin = createAMQPConnection(scope)
+        val queue = "test-refused-restore-close-${Uuid.random()}"
+        try {
+            val adminChannel = admin.openChannel()
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+
+            connection.connect()
+            val channel = connection.openChannel() as RefusedRestoreChannel
+            val receiver = channel.basicConsume(queue = queue, noAck = true, arguments = emptyMap())
+            channel.beforeRestoreConsume = { adminChannel.queueDelete(queue) }
+
+            connection.write(Frame(channelId = 1u, payload = Frame.Heartbeat))
+            withTimeout(10.seconds) { channel.restoreConsumeRefused.await() }
+
+            // The queue is back: the retry restores the channel and its consumer.
+            adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
+            val restored = withTimeoutOrNull(10.seconds) {
+                while (adminChannel.consumerCount(queue) == 0u) delay(100)
+            }
+            assertNotNull(restored, "Channel was not restored once the queue was back")
+            adminChannel.basicPublish("Before close".toByteArray(), exchange = "", routingKey = queue)
+            val delivery = withTimeoutOrNull(5.seconds) { receiver.receive() }
+            assertNotNull(delivery, "Consumer was not restored once the queue was back")
+            assertEquals(ConnectionState.OPEN, channel.state)
+
+            val closed = withTimeoutOrNull(5.seconds) { channel.close() }
+            assertNotNull(closed, "close() did not return on a channel restored after a refused restore")
+            assertEquals(ConnectionState.CLOSED, channel.state)
+        } finally {
+            runCatching {
+                withTimeout(5.seconds) {
+                    admin.openChannel().queueDelete(queue)
+                    admin.close()
+                    connection.close()
+                }
+            }
+            scope.cancel()
+        }
+    }
+
+    /**
      * A retry the broker refuses as well is retried again, with the backoff, until the queue is back.
      */
     @Test

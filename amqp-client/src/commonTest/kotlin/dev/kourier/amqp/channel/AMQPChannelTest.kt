@@ -9,6 +9,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.test.runTest
 import kotlin.test.*
 import kotlin.time.Clock
+import kotlin.time.Duration.Companion.seconds
 import kotlin.uuid.Uuid
 
 class AMQPChannelTest {
@@ -834,6 +835,24 @@ class AMQPChannelTest {
                 runCatching { channel.queueDelete { name = queueName } }
                 channel.close()
             }
+        }
+    }
+
+    /**
+     * A `basic.consume` the broker refuses (404 NOT_FOUND, the queue does not exist) closes the channel before any
+     * `consume-ok`: the receive-channel variant must fail with the channel close, not wait for a consumer forever.
+     */
+    @Test
+    fun testBasicConsumeReceiveChannelRefused() = runTest {
+        withConnection { connection ->
+            val channel = connection.openChannel()
+            val queueName = "test-consume-receive-refused-${Uuid.random()}"
+            val exception = withTimeout(10.seconds) {
+                assertFailsWith<AMQPException.ChannelClosed> {
+                    channel.basicConsume(queue = queueName, noAck = true)
+                }
+            }
+            assertEquals(404u, exception.replyCode)
         }
     }
 
