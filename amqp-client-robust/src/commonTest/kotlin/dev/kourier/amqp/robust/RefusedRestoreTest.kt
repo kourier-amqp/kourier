@@ -192,9 +192,10 @@ class RefusedRestoreTest {
 
             // The queue is back: the retry restores the channel and its consumer.
             adminChannel.queueDeclare(queue, durable = false, exclusive = false, autoDelete = false, arguments = emptyMap())
-            withTimeoutOrNull(10.seconds) {
+            val restored = withTimeoutOrNull(10.seconds) {
                 while (adminChannel.consumerCount(queue) == 0u) delay(100)
             }
+            assertNotNull(restored, "Channel was not restored once the queue was back")
             adminChannel.basicPublish("Before close".toByteArray(), exchange = "", routingKey = queue)
             val delivery = withTimeoutOrNull(5.seconds) { receiver.receive() }
             assertNotNull(delivery, "Consumer was not restored once the queue was back")
