@@ -289,15 +289,24 @@ open class DefaultAMQPChannel(
     ): AMQPReceiveChannel {
         val deferredConsumeOk = CompletableDeferred<AMQPResponse.Channel.Basic.ConsumeOk>()
         val receiveChannel = connection.messageListeningScope.produce(capacity = Channel.UNLIMITED) {
-            val consumeOk = basicConsume(
-                queue = queue,
-                consumerTag = consumerTag,
-                noAck = noAck,
-                exclusive = exclusive,
-                arguments = arguments,
-                onDelivery = { trySend(it) },
-                onCanceled = { close() }
-            )
+            val consumeOk = try {
+                basicConsume(
+                    queue = queue,
+                    consumerTag = consumerTag,
+                    noAck = noAck,
+                    exclusive = exclusive,
+                    arguments = arguments,
+                    onDelivery = { trySend(it) },
+                    onCanceled = { close() }
+                )
+            } catch (e: Throwable) {
+                // No consume-ok will ever come (e.g. 404 NOT_FOUND closes the channel): fail the caller, which
+                // awaits deferredConsumeOk, instead of leaving it waiting forever.
+                deferredConsumeOk.completeExceptionally(e)
+                if (e is CancellationException) throw e
+                close(e)
+                return@produce
+            }
             deferredConsumeOk.complete(consumeOk)
             awaitClose {
                 // awaitClose's block is not a suspend context. The previous code used
@@ -423,7 +432,14 @@ open class DefaultAMQPChannel(
                 arguments = arguments
             )
         )
-        val result = writeAndWaitForResponse<AMQPResponse.Channel.Basic.ConsumeOk>(consume)
+        val result = try {
+            writeAndWaitForResponse<AMQPResponse.Channel.Basic.ConsumeOk>(consume)
+        } catch (e: Throwable) {
+            // No consumer: the listener would wait for its tag forever, and close() joins every listener of the
+            // channel (cancelAll), so a refused consume (e.g. 404 NOT_FOUND while restoring) would hang the close.
+            listeningJob.cancel()
+            throw e
+        }
         deferredConsumerTag.complete(result.consumerTag)
         // Index by broker-confirmed consumerTag so basicCancel can join the right listener.
         listeningJobsMutex.withLock { listeningJobsByConsumer[result.consumerTag] = listeningJob }
