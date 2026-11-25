@@ -358,6 +358,13 @@ open class DefaultAMQPChannel(
                 // (deferredListeningJob.cancel() below, and cancelAll() joining this job, both
                 // rely on cancellation actually stopping the collector).
                 try {
+                    // The channel closed before the broker confirmed the consume (a refused consume closes it): there
+                    // is no consumer to cancel, and awaiting its tag would never end. The pending basic.consume RPC
+                    // runs cancelAll, which joins this job, before it can fail, so this job must stop by itself.
+                    if (response is AMQPResponse.Channel.Closed && !deferredConsumerTag.isCompleted) {
+                        deferredListeningJob.await().cancel()
+                        return@collect
+                    }
                     val consumerTag = deferredConsumerTag.await()
                     when (response) {
                         is AMQPResponse.Channel.Closed -> {
@@ -436,7 +443,8 @@ open class DefaultAMQPChannel(
             writeAndWaitForResponse<AMQPResponse.Channel.Basic.ConsumeOk>(consume)
         } catch (e: Throwable) {
             // No consumer: the listener would wait for its tag forever, and close() joins every listener of the
-            // channel (cancelAll), so a refused consume (e.g. 404 NOT_FOUND while restoring) would hang the close.
+            // channel (cancelAll). It may not have seen the channel close (not subscribed yet), or the consume may
+            // have failed otherwise (e.g. RpcTimeout).
             listeningJob.cancel()
             throw e
         }
